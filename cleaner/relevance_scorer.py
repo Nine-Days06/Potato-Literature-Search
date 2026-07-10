@@ -28,7 +28,6 @@ from config.settings import (
 )
 from utils.db import get_conn
 from utils.logger import get_logger
-from cleaner.hard_filter import get_passed_pmids
 
 logger = get_logger("relevance_scorer")
 
@@ -42,19 +41,22 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 
 # ── 预编译关键词正则（全词匹配，忽略大小写） ─────────────────
 
-def _build_patterns(terms: list[str]) -> list[re.Pattern]:
-    """为每个词条构建全词边界正则，避免 'gene' 匹配到 'generally'"""
-    return [re.compile(r"\b" + re.escape(t) + r"\b", re.IGNORECASE) for t in terms]
+def _build_combined_pattern(terms: list[str]) -> re.Pattern:
+    """将所有词条合并为单一正则，一次扫描完成全部匹配"""
+    return re.compile(
+        r"\b(?:" + "|".join(re.escape(t) for t in terms) + r")\b",
+        re.IGNORECASE
+    )
 
 
-GENE_PATTERNS     = _build_patterns(GENE_TERMS)
-FUNCTION_PATTERNS = _build_patterns(FUNCTION_TERMS)
-TRAIT_PATTERNS    = _build_patterns(TRAIT_TERMS)
+GENE_PATTERN     = _build_combined_pattern(GENE_TERMS)
+FUNCTION_PATTERN = _build_combined_pattern(FUNCTION_TERMS)
+TRAIT_PATTERN    = _build_combined_pattern(TRAIT_TERMS)
 
 
-def _count_hits(text: str, patterns: list[re.Pattern]) -> int:
-    """返回命中的模式数量（每个模式只计 1 次，不管出现多少次）"""
-    return sum(1 for p in patterns if p.search(text))
+def _count_hits(text: str, pattern: re.Pattern) -> int:
+    """返回命中的唯一词条数量（每个词条只计 1 次，不管出现多少次）"""
+    return len(set(pattern.findall(text)))
 
 
 # ── 单篇评分 ─────────────────────────────────────────────────
@@ -71,11 +73,11 @@ def score_record(row) -> tuple:
         row["abstract"]   or "",
         row["keywords"]   or "",
         row["mesh_terms"] or "",
-    ])).lower()
+    ]))
 
-    g  = _count_hits(text, GENE_PATTERNS)
-    f  = _count_hits(text, FUNCTION_PATTERNS)
-    tr = _count_hits(text, TRAIT_PATTERNS)
+    g  = _count_hits(text, GENE_PATTERN)
+    f  = _count_hits(text, FUNCTION_PATTERN)
+    tr = _count_hits(text, TRAIT_PATTERN)
 
     total         = min(g + f + tr, 20)   # 截断上限，避免极端值影响分析
     has_all_three = int(g > 0 and f > 0 and tr > 0)
@@ -94,54 +96,58 @@ def score_record(row) -> tuple:
 
 def run_relevance_scoring(
     db_path: Path = DB_PATH,
-    batch_size: int = 2000,
+    page_size: int = 2000,
 ) -> dict:
     """
     对通过硬过滤的全部文献评分，结果写入 relevance_scores 表。
+    使用单次 JOIN + 游标分页，避免两次全表扫描。
     """
     db_path = Path(db_path)
     logger.info("=" * 60)
     logger.info("阶段三-B：相关性评分")
     logger.info("=" * 60)
 
-    passed_pmids = get_passed_pmids(db_path)
-    total = len(passed_pmids)
-    logger.info(f"待评分文献：{total} 篇")
+    query = """
+        SELECT a.pmid, a.title, a.abstract, a.keywords, a.mesh_terms
+        FROM articles a
+        WHERE NOT EXISTS (
+            SELECT 1 FROM filter_log f
+            WHERE f.pmid = a.pmid AND f.stage = 'hard_filter'
+        )
+        ORDER BY a.pmid
+        LIMIT ? OFFSET ?
+    """
 
-    # 清理旧评分
     with get_conn(db_path) as conn:
         conn.execute("DELETE FROM relevance_scores")
 
-    score_rows = []
-    processed  = 0
+        score_rows = []
+        processed  = 0
+        offset     = 0
 
-    # 分批从数据库读取，避免一次性载入全量
-    for start in range(0, total, batch_size):
-        chunk_pmids = passed_pmids[start : start + batch_size]
-        placeholders = ",".join("?" * len(chunk_pmids))
+        while True:
+            rows = conn.execute(query, (page_size, offset)).fetchall()
+            if not rows:
+                break
 
-        with get_conn(db_path) as conn:
-            rows = conn.execute(
-                f"SELECT pmid, title, abstract, keywords, mesh_terms "
-                f"FROM articles WHERE pmid IN ({placeholders})",
-                chunk_pmids,
-            ).fetchall()
+            for row in rows:
+                score_rows.append(score_record(row))
 
-        for row in rows:
-            score_rows.append(score_record(row))
+            processed += len(rows)
+            offset    += page_size
 
-        processed += len(rows)
-        if processed % 10000 == 0 or processed == total:
-            logger.info(f"  评分进度: {processed}/{total}")
+            if processed % 10000 == 0:
+                logger.info(f"  评分进度: {processed}")
 
-    # 写入评分表
-    with get_conn(db_path) as conn:
+        # 批量写入
         conn.executemany(INSERT_SCORE_SQL, score_rows)
 
-    # 统计分布
+    total = processed
+    logger.info(f"待评分文献：{total} 篇")
+
     label_counts = {"高相关": 0, "中相关": 0, "低相关": 0}
     for row in score_rows:
-        label_counts[row[6]] = label_counts.get(row[6], 0) + 1
+        label_counts[row[6]] += 1
 
     logger.info("评分完成，分布：")
     for label, cnt in label_counts.items():

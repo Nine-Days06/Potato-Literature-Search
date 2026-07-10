@@ -94,7 +94,7 @@ RULE_FUNCS = [
 
 # ── 重复标题检测 ──────────────────────────────────────────────
 
-def find_duplicate_titles(db_path: Path) -> set[str]:
+def find_duplicate_titles(db_path: Path = DB_PATH, conn: sqlite3.Connection = None) -> set[str]:
     """
     找出同期刊、同年份、完全相同标题（小写规范化后）的重复 PMID。
     保留最小 PMID（最早收录），其余标记为重复。
@@ -107,13 +107,15 @@ def find_duplicate_titles(db_path: Path) -> set[str]:
     duplicates: set[str] = set()
     seen: dict[tuple, str] = {}     # (norm_title, journal, year) → first_pmid
 
-    with get_conn(db_path) as conn:
+    if conn is not None:
         rows = conn.execute(query).fetchall()
+    else:
+        with get_conn(db_path) as c:
+            rows = c.execute(query).fetchall()
 
     for row in rows:
         key = (row["norm_title"], row["journal"] or "", row["pub_year"])
         if key in seen:
-            # 当前 pmid 是重复的，标记为过滤
             duplicates.add(row["pmid"])
         else:
             seen[key] = row["pmid"]
@@ -135,62 +137,57 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
 
     with get_conn(db_path) as conn:
         total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-    logger.info(f"articles 表共 {total} 条记录")
+        logger.info(f"articles 表共 {total} 条记录")
 
-    # 先找重复标题
-    logger.info("检测重复标题 ...")
-    dup_pmids = find_duplicate_titles(db_path)
-    logger.info(f"发现重复标题 {len(dup_pmids)} 篇")
+        # 先找重复标题（复用同一连接）
+        logger.info("检测重复标题 ...")
+        dup_pmids = find_duplicate_titles(db_path, conn=conn)
+        logger.info(f"发现重复标题 {len(dup_pmids)} 篇")
 
-    reason_counts: dict[str, int] = {}
-    filtered_pmids: set[str] = set()
-    log_rows: list[tuple] = []
+        reason_counts: dict[str, int] = {}
+        filtered_pmids: set[str] = set()
+        log_rows: list[tuple] = []
 
-    # 先清理旧的过滤日志（仅限当前阶段）
-    with get_conn(db_path) as conn:
+        # 清理旧的过滤日志（仅限当前阶段）
         conn.execute("DELETE FROM filter_log WHERE stage = 'hard_filter'")
-    
-    # 分批读取（避免全量加载到内存）
-    page_size = 5000
-    offset    = 0
-    now       = _now()
+        
+        # 分批读取（避免全量加载到内存）
+        page_size = 5000
+        offset    = 0
+        now       = _now()
 
-    while True:
-        with get_conn(db_path) as conn:
+        while True:
             rows = conn.execute(
                 "SELECT * FROM articles LIMIT ? OFFSET ?", (page_size, offset)
             ).fetchall()
 
-        if not rows:
-            break
+            if not rows:
+                break
 
-        for row in rows:
-            pmid = row["pmid"]
+            for row in rows:
+                pmid = row["pmid"]
 
-            # 重复标题
-            if pmid in dup_pmids:
-                reason = "duplicate_title"
-                reason_counts[reason] = reason_counts.get(reason, 0) + 1
-                filtered_pmids.add(pmid)
-                log_rows.append((pmid, reason, now))
-                continue
-
-            # 逐项规则检查
-            for rule_fn in RULE_FUNCS:
-                reason = rule_fn(row)
-                if reason:
-                    reason_counts[reason.split("(")[0]] = \
-                        reason_counts.get(reason.split("(")[0], 0) + 1
+                if pmid in dup_pmids:
+                    reason = "duplicate_title"
+                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
                     filtered_pmids.add(pmid)
                     log_rows.append((pmid, reason, now))
-                    break   # 命中一条即停止，避免重复记录
+                    continue
 
-        offset += page_size
-        if offset % 20000 == 0:
-            logger.info(f"  已扫描 {offset} / {total} ...")
+                for rule_fn in RULE_FUNCS:
+                    reason = rule_fn(row)
+                    if reason:
+                        reason_key = reason.split("(")[0]
+                        reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
+                        filtered_pmids.add(pmid)
+                        log_rows.append((pmid, reason, now))
+                        break
 
-    # 批量写入过滤日志
-    with get_conn(db_path) as conn:
+            offset += page_size
+            if offset % 20000 == 0:
+                logger.info(f"  已扫描 {offset} / {total} ...")
+
+        # 批量写入过滤日志
         conn.executemany(INSERT_LOG_SQL, log_rows)
 
     passed = total - len(filtered_pmids)
@@ -207,16 +204,21 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
     }
 
 
-def get_passed_pmids(db_path: Path = DB_PATH) -> list[str]:
+def get_passed_pmids(db_path: Path = DB_PATH, conn: sqlite3.Connection = None) -> list[str]:
     """
     返回通过硬过滤的 PMID 列表
     （即 articles 表中不在 filter_log 里的记录）
     """
-    with get_conn(db_path) as conn:
-        rows = conn.execute("""
-            SELECT pmid FROM articles
-            WHERE pmid NOT IN (
-                SELECT pmid FROM filter_log WHERE stage = 'hard_filter'
-            )
-        """).fetchall()
+    query = """
+        SELECT pmid FROM articles a
+        WHERE NOT EXISTS (
+            SELECT 1 FROM filter_log f
+            WHERE f.pmid = a.pmid AND f.stage = 'hard_filter'
+        )
+    """
+    if conn is not None:
+        rows = conn.execute(query).fetchall()
+    else:
+        with get_conn(db_path) as c:
+            rows = c.execute(query).fetchall()
     return [r["pmid"] for r in rows]

@@ -199,24 +199,21 @@ def parse_article(article_el: etree._Element, source_file: str) -> dict | None:
 
 # ── 批量解析单个 XML 文件 ─────────────────────────────────────
 
-def parse_xml_file(xml_path: Path, db_path: Path = DB_PATH) -> tuple[int, int]:
+def _parse_xml_content(xml_path: Path, source_name: str) -> tuple[list[tuple], int]:
     """
-    解析一个 XML 批次文件，写入数据库。
-    返回 (成功数, 跳过数) 元组。
+    解析一个 XML 文件内容，返回 (rows, skipped)。
+    不涉及数据库操作，便于复用连接。
     """
-    xml_path = Path(xml_path)
-    source_name = xml_path.name
-
     try:
         tree = etree.parse(str(xml_path), parser=etree.XMLParser(recover=True))
     except etree.XMLSyntaxError as e:
         logger.error(f"XML 语法错误，跳过 {source_name}: {e}")
-        return 0, 0
+        return [], 0
 
     articles = tree.findall(".//PubmedArticle")
     if not articles:
         logger.warning(f"{source_name} 中未找到 PubmedArticle 元素")
-        return 0, 0
+        return [], 0
 
     rows = []
     skipped = 0
@@ -235,13 +232,27 @@ def parse_xml_file(xml_path: Path, db_path: Path = DB_PATH) -> tuple[int, int]:
             ))
         else:
             skipped += 1
+    return rows, skipped
 
-    # 批量写入，INSERT OR IGNORE 避免重复
-    with get_conn(db_path) as conn:
+
+def parse_xml_file(xml_path: Path, db_path: Path = DB_PATH, conn: sqlite3.Connection = None) -> tuple[int, int]:
+    """
+    解析一个 XML 批次文件，写入数据库。
+    返回 (成功数, 跳过数) 元组。
+    如果提供 conn 参数则复用该连接，否则新建连接。
+    """
+    xml_path = Path(xml_path)
+    source_name = xml_path.name
+    rows, skipped = _parse_xml_content(xml_path, source_name)
+
+    if conn is not None:
         conn.executemany(INSERT_SQL, rows)
+    else:
+        with get_conn(db_path) as c:
+            c.executemany(INSERT_SQL, rows)
 
     logger.debug(
-        f"{source_name}: 解析 {len(articles)} 篇，"
+        f"{source_name}: 解析 {len(rows) + skipped} 篇，"
         f"写入 {len(rows)} 篇，跳过 {skipped} 篇"
     )
     return len(rows), skipped
@@ -272,12 +283,13 @@ def run_parse(xml_dir: Path = None, db_path: Path = DB_PATH) -> None:
 
     total_written = 0
     total_skipped = 0
-    for i, xf in enumerate(xml_files, 1):
-        w, s = parse_xml_file(xf, db_path)
-        total_written += w
-        total_skipped += s
-        if i % 10 == 0 or i == len(xml_files):
-            logger.info(f"进度: {i}/{len(xml_files)} 个文件，累计写入 {total_written} 篇")
+    with get_conn(db_path) as conn:
+        for i, xf in enumerate(xml_files, 1):
+            w, s = parse_xml_file(xf, db_path, conn=conn)
+            total_written += w
+            total_skipped += s
+            if i % 10 == 0 or i == len(xml_files):
+                logger.info(f"进度: {i}/{len(xml_files)} 个文件，累计写入 {total_written} 篇")
 
     logger.info(
         f"解析完成：写入 {total_written} 篇，解析失败 {total_skipped} 篇"

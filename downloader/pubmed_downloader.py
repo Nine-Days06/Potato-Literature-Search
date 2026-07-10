@@ -8,11 +8,14 @@ NCBI E-utilities 批量下载器
   4. 断点续传 — 已下载的批次自动跳过
 """
 
+import re
 import time
 import json
+import threading
 import requests
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import (
     NCBI_API_KEY, NCBI_EMAIL,
@@ -24,6 +27,23 @@ from utils.logger import get_logger
 from utils import db as dbutil
 
 logger = get_logger("downloader")
+
+# 全局速率限制器，保证并发请求不超出 NCBI API 频率限制
+class _RateLimiter:
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._last = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last
+            if elapsed < self.interval:
+                time.sleep(self.interval - elapsed)
+            self._last = time.time()
+
+_rate_limiter = _RateLimiter(REQUEST_INTERVAL)
 
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
@@ -63,7 +83,6 @@ def _safe_json(r: requests.Response) -> dict:
     except (json.JSONDecodeError, requests.exceptions.JSONDecodeError) as e:
         logger.warning(f"检测到非法 JSON 响应，尝试修复... ({e})")
         # 常见问题：JSON 字符串中包含未转义的换行符
-        import re
         # 将原始控制字符替换为转义后的（特别是换行符）
         # 这里简单起见，先把 \n \r 替换掉，因为它们最常导致解析失败
         text = r.text.replace('\n', '\\n').replace('\r', '\\r')
@@ -164,15 +183,53 @@ def fetch_pmid_list(query: str = PUBMED_QUERY,
 
 # ── Step 3：efetch 批量下载 XML ───────────────────────────────
 
+def _download_single_batch(
+    batch_idx: int,
+    chunk: list[str],
+    out_dir: Path,
+    batch_size: int,
+    total_batches: int,
+) -> Path | None:
+    """下载单个批次，由线程池调用，受全局速率限制器控制"""
+    batch_file = out_dir / f"batch_{batch_idx:05d}.xml"
+
+    if batch_file.exists() and batch_file.stat().st_size > 0:
+        logger.info(f"  [批次 {batch_idx+1}/{total_batches}] 已存在，跳过")
+        return batch_file
+
+    params = {
+        **_base_params(),
+        "db": "pubmed",
+        "id": ",".join(chunk),
+        "rettype": "xml",
+        "retmode": "xml",
+    }
+
+    _rate_limiter.wait()
+    try:
+        r = _get(f"{EUTILS_BASE}/efetch.fcgi", params)
+        with open(batch_file, "wb") as f:
+            f.write(r.content)
+        logger.info(
+            f"  [批次 {batch_idx+1}/{total_batches}] "
+            f"下载 {len(chunk)} 篇 → {batch_file.name} "
+            f"({batch_file.stat().st_size / 1024:.1f} KB)"
+        )
+        return batch_file
+    except Exception as e:
+        logger.error(f"  [批次 {batch_idx+1}] 下载失败: {e}")
+        return None
+
+
 def download_xml_batches(
     pmids: list[str],
     out_dir: Path = RAW_XML_DIR,
     batch_size: int = EFETCH_BATCH_SIZE,
 ) -> list[Path]:
     """
-    将 PMID 列表分批，通过 efetch 下载 PubmedArticleSet XML。
+    将 PMID 列表分批，通过 efetch 并发下载 PubmedArticleSet XML。
     已存在的批次文件自动跳过（断点续传）。
-    返回所有批次文件路径。
+    返回所有成功下载的批次文件路径。
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -183,42 +240,30 @@ def download_xml_batches(
         json.dump({"query": PUBMED_QUERY, "total": len(pmids), "pmids": pmids}, f)
     logger.info(f"PMID 列表已保存至 {pmid_list_path}")
 
-    # 计算总批次
     total_batches = (len(pmids) + batch_size - 1) // batch_size
+    max_workers = 3 if not NCBI_API_KEY else 8
+
+    chunks = [
+        pmids[i * batch_size : (i + 1) * batch_size]
+        for i in range(total_batches)
+    ]
+
     xml_files = []
-
-    for batch_idx in range(total_batches):
-        batch_file = out_dir / f"batch_{batch_idx:05d}.xml"
-
-        if batch_file.exists() and batch_file.stat().st_size > 0:
-            logger.info(f"  [批次 {batch_idx+1}/{total_batches}] 已存在，跳过")
-            xml_files.append(batch_file)
-            continue
-
-        chunk = pmids[batch_idx * batch_size : (batch_idx + 1) * batch_size]
-        params = {
-            **_base_params(),
-            "db": "pubmed",
-            "id": ",".join(chunk),
-            "rettype": "xml",
-            "retmode": "xml",
-        }
-
-        try:
-            r = _get(f"{EUTILS_BASE}/efetch.fcgi", params)
-            with open(batch_file, "wb") as f:
-                f.write(r.content)
-            xml_files.append(batch_file)
-            logger.info(
-                f"  [批次 {batch_idx+1}/{total_batches}] "
-                f"下载 {len(chunk)} 篇 → {batch_file.name} "
-                f"({batch_file.stat().st_size / 1024:.1f} KB)"
+    futures = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for batch_idx, chunk in enumerate(chunks):
+            future = executor.submit(
+                _download_single_batch, batch_idx, chunk,
+                out_dir, batch_size, total_batches
             )
-        except Exception as e:
-            logger.error(f"  [批次 {batch_idx+1}] 下载失败: {e}")
+            futures[future] = batch_idx
 
-        time.sleep(REQUEST_INTERVAL)
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                xml_files.append(result)
 
+    xml_files.sort()
     logger.info(f"下载完成，共 {len(xml_files)} 个批次文件")
     return xml_files
 

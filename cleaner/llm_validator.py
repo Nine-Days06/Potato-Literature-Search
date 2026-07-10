@@ -453,24 +453,28 @@ def import_human_review(csv_path: str | None = None):
     passed = 0
     rejected = 0
     skipped = 0
+    updates = []
 
     with open(review_file, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
+        for row in reader:
+            pmid = row.get("pmid", "").strip()
+            review = row.get("human_review", "").strip().upper()
+            if not pmid:
+                skipped += 1
+                continue
+            if review not in ("Y", "N"):
+                skipped += 1
+                continue
+            updates.append((review, pmid))
+            if review == "Y":
+                passed += 1
+            else:
+                rejected += 1
+
+    if updates:
         with get_conn(DB_PATH) as conn:
-            for row in reader:
-                pmid = row.get("pmid", "").strip()
-                review = row.get("human_review", "").strip().upper()
-                if not pmid:
-                    skipped += 1
-                    continue
-                if review not in ("Y", "N"):
-                    skipped += 1
-                    continue
-                conn.execute(UPDATE_HUMAN_REVIEW_SQL, (review, pmid))
-                if review == "Y":
-                    passed += 1
-                else:
-                    rejected += 1
+            conn.executemany(UPDATE_HUMAN_REVIEW_SQL, updates)
 
     logger.info(f"导入完成: Y {passed} 篇, N {rejected} 篇, 跳过 {skipped} 行")
 
