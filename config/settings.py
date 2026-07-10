@@ -139,18 +139,23 @@ HIGH_SCORE_THRESHOLD = 5
 MID_SCORE_THRESHOLD  = 3
 
 # ── LLM 验证配置 ──────────────────────────────────────────────
-LLM_PROVIDER    = "zhipu"            # "deepseek" | "zhipu"
+LLM_PROVIDER    = "deepseek"          # "deepseek" | "zhipu" | "openai"
 
 # DeepSeek（OpenAI 兼容格式）
-LLM_API_KEY     = os.environ.get("LLM_API_KEY", "")  # 优先从环境变量或 .env 读取
-LLM_BASE_URL    = "https://api.deepseek.com"
-LLM_MODEL       = "deepseek-v4-flash"
+DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL    = "deepseek-v4-flash"
 
 # 智谱AI（原生 zhipuai SDK）
-ZHIPU_API_KEY   = os.environ.get("ZHIPU_API_KEY", "")  # 优先从环境变量或 .env 读取
+ZHIPU_API_KEY   = os.environ.get("ZHIPU_API_KEY", "")
 ZHIPU_MODEL     = "glm-4.7-flash"
 
+# 其他 OpenAI 兼容 API（如 OpenAI、SiliconFlow、vLLM 等）
+OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = "https://api.openai.com/v1"
+OPENAI_MODEL    = "gpt-4o-mini"
+
 LLM_BATCH_SIZE  = 10                    # 每次调用验证的文献数量
-LLM_MAX_TOKENS  = 8192                   # 每次 API 调用的最大 token 数（减少被截断）
+LLM_MAX_TOKENS  = 8192                   # 每次 API 调用的最大 token 数
 LLM_MAX_RETRIES = 3                     # 单次 API 调用重试次数（指数退避 2s/4s/8s）
 LLM_MAX_ROUNDS  = 2                     # 轮次重试次数（初始 1 轮 + 额外重试轮数）

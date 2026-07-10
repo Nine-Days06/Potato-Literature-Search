@@ -16,8 +16,11 @@ from openai import OpenAI
 
 from config.settings import (
     DB_PATH, OUTPUT_DIR, LOG_DIR,
-    LLM_BASE_URL, LLM_MODEL, LLM_BATCH_SIZE, LLM_MAX_TOKENS, LLM_MAX_RETRIES, LLM_MAX_ROUNDS,
-    LLM_API_KEY, LLM_PROVIDER, ZHIPU_API_KEY, ZHIPU_MODEL,
+    LLM_BATCH_SIZE, LLM_MAX_TOKENS, LLM_MAX_RETRIES, LLM_MAX_ROUNDS,
+    LLM_PROVIDER,
+    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
+    ZHIPU_API_KEY, ZHIPU_MODEL,
+    OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL,
 )
 from utils.db import get_conn
 from utils.logger import get_logger
@@ -181,15 +184,27 @@ def _call_llm(rows: list) -> tuple[list[dict], list[str]]:
         model = ZHIPU_MODEL
         create_kwargs = {"model": model, "temperature": 0, "max_tokens": LLM_MAX_TOKENS}
         response_attr = "choices"
-    else:
-        api_key = os.environ.get("LLM_API_KEY") or LLM_API_KEY
+    elif LLM_PROVIDER == "deepseek":
+        api_key = os.environ.get("DEEPSEEK_API_KEY") or DEEPSEEK_API_KEY
         if not api_key:
-            logger.error("未设置 LLM_API_KEY（环境变量或 config/settings.py）")
+            logger.error("未设置 DEEPSEEK_API_KEY（环境变量或 config/settings.py）")
             return [], failed_pmids
-        client = OpenAI(api_key=api_key, base_url=LLM_BASE_URL)
-        model = LLM_MODEL
+        client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+        model = DEEPSEEK_MODEL
         create_kwargs = {"model": model, "temperature": 0, "max_tokens": LLM_MAX_TOKENS, "timeout": 120}
         response_attr = "choices"
+    elif LLM_PROVIDER == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY") or OPENAI_API_KEY
+        if not api_key:
+            logger.error("未设置 OPENAI_API_KEY（环境变量或 config/settings.py）")
+            return [], failed_pmids
+        client = OpenAI(api_key=api_key, base_url=OPENAI_BASE_URL)
+        model = OPENAI_MODEL
+        create_kwargs = {"model": model, "temperature": 0, "max_tokens": LLM_MAX_TOKENS, "timeout": 120}
+        response_attr = "choices"
+    else:
+        logger.error(f"未知的 LLM_PROVIDER: {LLM_PROVIDER}")
+        return [], failed_pmids
 
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
