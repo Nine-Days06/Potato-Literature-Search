@@ -139,13 +139,13 @@ SYSTEM_PROMPT = (
     "3. 基因调控与分子生物学（基因表达、转录因子、调控网络、基因功能等）\n"
     "4. 多组学（基因组、转录组、蛋白质组、代谢组、表观组、miRNA等）\n"
     "5. 功能遗传学（QTL、GWAS、基因定位、分子标记、等位基因等）\n\n"
-    "判断标准：\n"
+     "判断标准：\n"
     "- 如果文献主要研究马铃薯本身，且涉及上述任一方向 → RELEVANT\n"
     "- 如果文献仅在其他物种中研究上述方向，不涉及马铃薯 → NOT_RELEVANT\n"
     "- 如果文献涉及马铃薯但仅为实验材料背景，不作核心研究内容 → NOT_RELEVANT\n\n"
-     "请以 JSON 数组格式逐条回答，不要包含其他内容：\n"
+     "请以 JSON 对象格式逐条回答，不要包含其他内容：\n"
      'reason 请用中文简要说明判断依据。\n'
-     '[{"pmid":"...","verdict":"RELEVANT 或 NOT_RELEVANT","reason":"判断理由"}]'
+     '{"results":[{"pmid":"...","verdict":"RELEVANT 或 NOT_RELEVANT","reason":"判断理由"}]}'
 )
 
 INSERT_SQL = """
@@ -197,7 +197,7 @@ def _call_llm(rows: list) -> tuple[list[dict], list[str]]:
             return [], failed_pmids
         client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
         model = DEEPSEEK_MODEL
-        create_kwargs = {"model": model, "temperature": 0, "max_tokens": LLM_MAX_TOKENS, "timeout": 120}
+        create_kwargs = {"model": model, "temperature": 0, "max_tokens": LLM_MAX_TOKENS, "timeout": 120, "response_format": {"type": "json_object"}}
         response_attr = "choices"
     elif LLM_PROVIDER == "openai":
         api_key = os.environ.get("OPENAI_API_KEY") or OPENAI_API_KEY
@@ -223,7 +223,19 @@ def _call_llm(rows: list) -> tuple[list[dict], list[str]]:
             )
             choices = getattr(resp, response_attr)
             content = choices[0].message.content.strip()
-            result = _extract_json(content, fix_glm_multi_array=(LLM_PROVIDER == "zhipu"))
+
+            result = None
+            try:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    result = data
+                elif isinstance(data, dict) and "results" in data and isinstance(data["results"], list):
+                    result = data["results"]
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+            if result is None:
+                result = _extract_json(content, fix_glm_multi_array=(LLM_PROVIDER == "zhipu"))
             if result is None:
                 raise ValueError(f"无法从 LLM 响应中提取有效 JSON: {content[:200]}")
             return result, []
