@@ -324,7 +324,10 @@ def run_validation():
                     if pmid in failed_set:
                         round_failed.append(row)
                         continue
-                    r = pmid_to_result.get(pmid, {})
+                    r = pmid_to_result.get(pmid)
+                    if r is None:
+                        round_failed.append(row)
+                        continue
                     log_rows.append((pmid, row["label"],
                                      r.get("verdict", "UNKNOWN"),
                                      r.get("reason", ""), now))

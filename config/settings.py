@@ -139,7 +139,7 @@ HIGH_SCORE_THRESHOLD = 5
 MID_SCORE_THRESHOLD  = 3
 
 # ── LLM 验证配置 ──────────────────────────────────────────────
-LLM_PROVIDER    = "deepseek"          # "deepseek" | "zhipu" | "openai"
+LLM_PROVIDER    = "zhipu"          # "deepseek" | "zhipu" | "openai"
 
 # DeepSeek（OpenAI 兼容格式）
 DEEPSEEK_API_KEY  = os.environ.get("DEEPSEEK_API_KEY", "")
