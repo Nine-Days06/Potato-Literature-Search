@@ -152,8 +152,8 @@ ZHIPU_MODEL     = "glm-4.7-flash"
 
 # 其他 OpenAI 兼容 API（如 OpenAI、SiliconFlow、vLLM 等）
 OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = "https://api.openai.com/v1"
-OPENAI_MODEL    = "gpt-4o-mini"
+OPENAI_BASE_URL = "https://integrate.api.nvidia.com/v1"
+OPENAI_MODEL    = "deepseek-ai/deepseek-v4-pro"
 
 LLM_BATCH_SIZE  = 10                    # 每次调用验证的文献数量
 LLM_MAX_TOKENS  = 8192                   # 每次 API 调用的最大 token 数
