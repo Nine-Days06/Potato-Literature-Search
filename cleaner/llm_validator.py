@@ -139,6 +139,10 @@ SYSTEM_PROMPT = (
     "3. 基因调控与分子生物学（基因表达、转录因子、调控网络、基因功能等）\n"
     "4. 多组学（基因组、转录组、蛋白质组、代谢组、表观组、miRNA等）\n"
     "5. 功能遗传学（QTL、GWAS、基因定位、分子标记、等位基因等）\n\n"
+    "判断标准：\n"
+    "- 如果文献主要研究马铃薯本身，且涉及上述任一方向 → RELEVANT\n"
+    "- 如果文献仅在其他物种中研究上述方向，不涉及马铃薯 → NOT_RELEVANT\n"
+    "- 如果文献涉及马铃薯但仅为实验材料背景，不作核心研究内容 → NOT_RELEVANT\n\n"
      "请以 JSON 数组格式逐条回答，不要包含其他内容：\n"
      'reason 请用中文简要说明判断依据。\n'
      '[{"pmid":"...","verdict":"RELEVANT 或 NOT_RELEVANT","reason":"判断理由"}]'
@@ -157,7 +161,9 @@ UPDATE llm_validation SET human_review = ? WHERE pmid = ?
 
 def _build_batch_prompt(rows: list) -> str:
     """为一批文献构建 prompt 正文"""
-    parts = []
+    parts = [
+        "以下是需要你根据上述标准判断的马铃薯研究方向文献列表，请逐条判断：\n\n"
+    ]
     for i, row in enumerate(rows, 1):
         title = (row["title"] or "").strip()
         abstract = (row["abstract"] or "").strip()
