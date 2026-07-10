@@ -382,7 +382,7 @@ def _export_failed_pmids_csv(failed_rows: list) -> Path | None:
         writer = csv.writer(f)
         writer.writerow(["pmid", "title", "abstract_preview"])
         for row in failed_rows:
-            writer.writerow([row["pmid"], row["title"], (row["abstract"] or "")[:200]])
+            writer.writerow([row["pmid"], row["title"], row["abstract"] or ""])
     logger.warning(f"仍有 {len(failed_rows)} 篇验证失败: {csv_path}")
     return csv_path
 
@@ -411,14 +411,14 @@ def _export_review_csv() -> Path | None:
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "pmid", "title", "abstract_preview",
+            "pmid", "title", "abstract",
             "relevance_label", "llm_verdict", "reason", "human_review",
         ])
         for row in rows:
             writer.writerow([
                 row["pmid"],
                 row["title"],
-                (row["abstract"] or "")[:200],
+                row["abstract"] or "",
                 row["relevance_label"],
                 row["llm_verdict"],
                 row["reason"],
