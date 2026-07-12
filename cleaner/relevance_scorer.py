@@ -1,9 +1,8 @@
 # cleaner/relevance_scorer.py
 """
 相关性评分模块
-对通过硬过滤的文献进行两级评分：
+对通过硬过滤的文献进行评分：
   1. 关键词命中计数（快速，可解释）
-  2. TF-IDF 向量相似度（可选，用于辅助排序）
 
 评分逻辑：
   - 分别统计 gene_hits / function_hits / trait_hits

@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS llm_validation (
     llm_verdict      TEXT,      -- RELEVANT / NOT_RELEVANT
     reason           TEXT,      -- LLM 判断理由
     validated_at     TEXT,      -- 验证时间
-    human_review     TEXT       -- NULL=待复核, PASS=通过, REJECT=驳回
+    human_review     TEXT       -- NULL=待复核, Y=通过, N=驳回
 );
 """
 
