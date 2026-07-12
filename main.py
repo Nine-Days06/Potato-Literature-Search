@@ -108,7 +108,7 @@ def main():
 
     # 初始化目录和数据库
     for d in [RAW_XML_DIR, OUTPUT_DIR, LOG_DIR, PDF_HIGH_DIR, PDF_MID_DIR, PDF_LOW_DIR, DB_PATH.parent]:
-        Path(d).mkdir(parents=True, exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True)
     init_db(DB_PATH)
 
     logger.info("▶  马铃薯文献清洗系统启动")

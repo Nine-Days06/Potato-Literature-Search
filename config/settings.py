@@ -159,3 +159,37 @@ LLM_BATCH_SIZE  = 10                    # 每次调用验证的文献数量
 LLM_MAX_TOKENS  = 8192                   # 每次 API 调用的最大 token 数
 LLM_MAX_RETRIES = 3                     # 单次 API 调用重试次数（指数退避 2s/4s/8s）
 LLM_MAX_ROUNDS  = 2                     # 轮次重试次数（初始 1 轮 + 额外重试轮数）
+
+# Provider 配置字典 — 新增 provider 只需在此添加一项
+LLM_PROVIDER_CONFIGS = {
+    "zhipu": {
+        "api_key_env": "ZHIPU_API_KEY",
+        "api_key_fallback": ZHIPU_API_KEY,
+        "client_type": "zhipuai",
+        "model": ZHIPU_MODEL,
+        "base_url": None,
+        "extra_kwargs": {"temperature": 0, "max_tokens": LLM_MAX_TOKENS},
+        "fix_multi_array": True,
+    },
+    "deepseek": {
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "api_key_fallback": DEEPSEEK_API_KEY,
+        "client_type": "openai",
+        "model": DEEPSEEK_MODEL,
+        "base_url": DEEPSEEK_BASE_URL,
+        "extra_kwargs": {
+            "temperature": 0, "max_tokens": LLM_MAX_TOKENS,
+            "timeout": 120, "response_format": {"type": "json_object"},
+        },
+        "fix_multi_array": False,
+    },
+    "openai": {
+        "api_key_env": "OPENAI_API_KEY",
+        "api_key_fallback": OPENAI_API_KEY,
+        "client_type": "openai",
+        "model": OPENAI_MODEL,
+        "base_url": OPENAI_BASE_URL,
+        "extra_kwargs": {"temperature": 0, "max_tokens": LLM_MAX_TOKENS, "timeout": 120},
+        "fix_multi_array": False,
+    },
+}

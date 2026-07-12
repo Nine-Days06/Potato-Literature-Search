@@ -12,7 +12,6 @@
 """
 
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 
 from config.settings import (
@@ -21,6 +20,7 @@ from config.settings import (
     PUB_YEAR_MIN, PUB_YEAR_MAX,
     EXCLUDED_ARTICLE_TYPES,
 )
+from utils import now_iso
 from utils.db import get_conn
 from utils.logger import get_logger
 
@@ -31,10 +31,6 @@ INSERT_LOG_SQL = """
 INSERT OR REPLACE INTO filter_log (pmid, stage, reason, filtered_at)
 VALUES (?, 'hard_filter', ?, ?)
 """
-
-
-def _now() -> str:
-    return datetime.utcnow().isoformat()
 
 
 # ── 单条规则函数 ──────────────────────────────────────────────
@@ -154,7 +150,7 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
         # 分批读取（避免全量加载到内存）
         page_size = 5000
         offset    = 0
-        now       = _now()
+        now       = now_iso()
 
         while True:
             rows = conn.execute(

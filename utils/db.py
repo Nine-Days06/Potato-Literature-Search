@@ -88,6 +88,9 @@ def get_conn(db_path: Path):
         conn.close()
 
 
+VALID_TABLES = {"articles", "filter_log", "relevance_scores", "llm_validation"}
+
+
 def get_all_pmids(db_path: Path) -> list[str]:
     """返回数据库中所有 PMID"""
     with get_conn(db_path) as conn:
@@ -96,5 +99,7 @@ def get_all_pmids(db_path: Path) -> list[str]:
 
 
 def count_table(db_path: Path, table: str) -> int:
+    if table not in VALID_TABLES:
+        raise ValueError(f"Invalid table name: {table}")
     with get_conn(db_path) as conn:
         return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

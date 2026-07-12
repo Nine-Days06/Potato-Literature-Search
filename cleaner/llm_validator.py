@@ -17,11 +17,9 @@ from openai import OpenAI
 from config.settings import (
     DB_PATH, OUTPUT_DIR, LOG_DIR,
     LLM_BATCH_SIZE, LLM_MAX_TOKENS, LLM_MAX_RETRIES, LLM_MAX_ROUNDS,
-    LLM_PROVIDER,
-    DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
-    ZHIPU_API_KEY, ZHIPU_MODEL,
-    OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL,
+    LLM_PROVIDER, LLM_PROVIDER_CONFIGS,
 )
+from utils import now_iso
 from utils.db import get_conn
 from utils.logger import get_logger
 
@@ -174,43 +172,44 @@ def _build_batch_prompt(rows: list) -> str:
     return "\n".join(parts)
 
 
+def _build_client() -> tuple:
+    """
+    根据 LLM_PROVIDER 配置创建 client，返回 (client, model, extra_kwargs, fix_multi_array)。
+    失败时返回 (None, None, None, None)。
+    """
+    cfg = LLM_PROVIDER_CONFIGS.get(LLM_PROVIDER)
+    if not cfg:
+        logger.error(f"未知的 LLM_PROVIDER: {LLM_PROVIDER}")
+        return None, None, None, None
+
+    api_key = os.environ.get(cfg["api_key_env"]) or cfg["api_key_fallback"]
+    if not api_key:
+        logger.error(f"未设置 {cfg['api_key_env']}（环境变量或 config/settings.py）")
+        return None, None, None, None
+
+    if cfg["client_type"] == "zhipuai":
+        from zhipuai import ZhipuAI
+        client = ZhipuAI(api_key=api_key)
+    else:
+        client = OpenAI(api_key=api_key, base_url=cfg["base_url"])
+
+    extra_kwargs = {k: v for k, v in cfg["extra_kwargs"].items()}
+    extra_kwargs["model"] = cfg["model"]
+
+    return client, cfg["model"], extra_kwargs, cfg["fix_multi_array"]
+
+
 def _call_llm(rows: list) -> tuple[list[dict], list[str]]:
     """调用 LLM API 验证一批文献，返回 (成功结果列表, 失败 PMID 列表)"""
     prompt = _build_batch_prompt(rows)
     last_exception = None
     failed_pmids = [row["pmid"] for row in rows]
 
-    if LLM_PROVIDER == "zhipu":
-        from zhipuai import ZhipuAI
-        api_key = os.environ.get("ZHIPU_API_KEY") or ZHIPU_API_KEY
-        if not api_key:
-            logger.error("未设置 ZHIPU_API_KEY（环境变量或 config/settings.py）")
-            return [], failed_pmids
-        client = ZhipuAI(api_key=api_key)
-        model = ZHIPU_MODEL
-        create_kwargs = {"model": model, "temperature": 0, "max_tokens": LLM_MAX_TOKENS}
-        response_attr = "choices"
-    elif LLM_PROVIDER == "deepseek":
-        api_key = os.environ.get("DEEPSEEK_API_KEY") or DEEPSEEK_API_KEY
-        if not api_key:
-            logger.error("未设置 DEEPSEEK_API_KEY（环境变量或 config/settings.py）")
-            return [], failed_pmids
-        client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
-        model = DEEPSEEK_MODEL
-        create_kwargs = {"model": model, "temperature": 0, "max_tokens": LLM_MAX_TOKENS, "timeout": 120, "response_format": {"type": "json_object"}}
-        response_attr = "choices"
-    elif LLM_PROVIDER == "openai":
-        api_key = os.environ.get("OPENAI_API_KEY") or OPENAI_API_KEY
-        if not api_key:
-            logger.error("未设置 OPENAI_API_KEY（环境变量或 config/settings.py）")
-            return [], failed_pmids
-        client = OpenAI(api_key=api_key, base_url=OPENAI_BASE_URL)
-        model = OPENAI_MODEL
-        create_kwargs = {"model": model, "temperature": 0, "max_tokens": LLM_MAX_TOKENS, "timeout": 120}
-        response_attr = "choices"
-    else:
-        logger.error(f"未知的 LLM_PROVIDER: {LLM_PROVIDER}")
+    client, model, create_kwargs, fix_multi_array = _build_client()
+    if client is None:
         return [], failed_pmids
+
+    response_attr = "choices"
 
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
@@ -235,7 +234,7 @@ def _call_llm(rows: list) -> tuple[list[dict], list[str]]:
                 pass
 
             if result is None:
-                result = _extract_json(content, fix_glm_multi_array=(LLM_PROVIDER == "zhipu"))
+                result = _extract_json(content, fix_glm_multi_array=fix_multi_array)
             if result is None:
                 raise ValueError(f"无法从 LLM 响应中提取有效 JSON: {content[:200]}")
             return result, []
@@ -316,7 +315,7 @@ def run_validation():
             failed_set = set(failed_pmids)
 
             if results:
-                now = datetime.utcnow().isoformat()
+                now = now_iso()
                 pmid_to_result = {r["pmid"]: r for r in results}
                 log_rows = []
                 for row in batch:
@@ -449,6 +448,14 @@ def import_human_review(csv_path: str | None = None):
         review_file = candidates[0]
 
     logger.info(f"导入复核文件: {review_file}")
+
+    with open(review_file, "r", encoding="utf-8-sig", newline="") as f_check:
+        reader_check = csv.DictReader(f_check)
+        required_cols = {"pmid", "human_review"}
+        if not required_cols.issubset(reader_check.fieldnames or []):
+            missing = required_cols - set(reader_check.fieldnames or [])
+            logger.error(f"CSV 缺少必需列: {missing}")
+            return
 
     passed = 0
     rejected = 0

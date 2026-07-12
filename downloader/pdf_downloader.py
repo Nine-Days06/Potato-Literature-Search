@@ -31,6 +31,9 @@ from utils.logger import get_logger
 
 logger = get_logger("pdf_downloader")
 
+MIN_VALID_FILE_BYTES = 1024
+MIN_VALID_TEXT_CHARS = 200
+
 OA_FETCH_MAX_WORKERS = 8
 DOWNLOAD_MAX_WORKERS = 8
 OA_LINKS_CACHE_GLOB = "oa_download_links_*.csv"
@@ -417,7 +420,7 @@ def download_pdf_file(url: str, dest_path: Path) -> bool:
     下载单个 PDF 文件，支持断点续传（检查是否存在）。
     成功返回 True，失败返回 False。
     """
-    if dest_path.exists() and dest_path.stat().st_size > 1024: 
+    if dest_path.exists() and dest_path.stat().st_size > MIN_VALID_FILE_BYTES: 
         return True
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -427,7 +430,7 @@ def download_pdf_file(url: str, dest_path: Path) -> bool:
         if not _run_aria2c_download(url, temp_path):
             raise RuntimeError("aria2c 执行失败")
 
-        if temp_path.stat().st_size <= 1024:
+        if temp_path.stat().st_size <= MIN_VALID_FILE_BYTES:
             raise RuntimeError("下载文件过小，可能不是有效 PDF")
 
         temp_path.replace(dest_path)
@@ -438,7 +441,7 @@ def download_pdf_file(url: str, dest_path: Path) -> bool:
 
         if temp_path.exists():
             temp_path.unlink()
-        if dest_path.exists() and dest_path.stat().st_size <= 1024:
+        if dest_path.exists() and dest_path.stat().st_size <= MIN_VALID_FILE_BYTES:
             dest_path.unlink()
 
         return False
@@ -449,7 +452,7 @@ def download_txt_from_tgz(url: str, dest_path: Path) -> bool:
     从 OA tgz 包中提取正文并保存为 txt。
     优先使用包内现成 txt；否则从 nxml/xml 提取纯文本。
     """
-    if dest_path.exists() and dest_path.stat().st_size > 1024:
+    if dest_path.exists() and dest_path.stat().st_size > MIN_VALID_FILE_BYTES:
         return True
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -485,15 +488,11 @@ def download_txt_from_tgz(url: str, dest_path: Path) -> bool:
                     chunks = [s.strip() for s in root.itertext() if s and s.strip()]
                     text_content = "\n".join(chunks)
 
-        if len(text_content) <= 200:
+        if len(text_content) <= MIN_VALID_TEXT_CHARS:
             raise RuntimeError("提取到的正文过短，疑似无效内容")
 
         with open(temp_path, "w", encoding="utf-8") as f:
             f.write(text_content)
-
-        # 对文本文件按字符长度判定有效性，避免英文内容被字节阈值误杀
-        if len(text_content.strip()) <= 200:
-            raise RuntimeError("TXT 内容过短，可能提取失败")
 
         temp_path.replace(dest_path)
         return True
@@ -515,7 +514,7 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
     从 OA tgz 包中提取 PDF，并保存为 .pdf。
     当 `oa.fcgi` 未返回 pdf 直链但包内包含 PDF 时可作为回退策略。
     """
-    if dest_path.exists() and dest_path.stat().st_size > 1024:
+    if dest_path.exists() and dest_path.stat().st_size > MIN_VALID_FILE_BYTES:
         return True
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -542,13 +541,13 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
                 raise RuntimeError("无法读取 tgz 包内 PDF 文件")
             pdf_bytes = extracted.read()
 
-        if not pdf_bytes or len(pdf_bytes) <= 1024:
+        if not pdf_bytes or len(pdf_bytes) <= MIN_VALID_FILE_BYTES:
             raise RuntimeError("提取到的 PDF 过小，可能无效")
 
         with open(temp_path, "wb") as f:
             f.write(pdf_bytes)
 
-        if temp_path.stat().st_size <= 1024:
+        if temp_path.stat().st_size <= MIN_VALID_FILE_BYTES:
             raise RuntimeError("PDF 文件过小，可能提取失败")
 
         temp_path.replace(dest_path)
@@ -557,7 +556,7 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
         logger.error(f"  TGZ->PDF 提取失败: {url} -> {e}")
         if temp_path.exists():
             temp_path.unlink()
-        if dest_path.exists() and dest_path.stat().st_size <= 1024:
+        if dest_path.exists() and dest_path.stat().st_size <= MIN_VALID_FILE_BYTES:
             dest_path.unlink()
         return False
     finally:

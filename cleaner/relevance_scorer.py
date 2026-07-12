@@ -19,6 +19,7 @@
 
 import re
 import csv
+from datetime import datetime
 from pathlib import Path
 
 from config.settings import (
@@ -121,17 +122,20 @@ def run_relevance_scoring(
     with get_conn(db_path) as conn:
         conn.execute("DELETE FROM relevance_scores")
 
-        score_rows = []
-        processed  = 0
-        offset     = 0
+        processed     = 0
+        offset        = 0
+        label_counts  = {"高相关": 0, "中相关": 0, "低相关": 0}
 
         while True:
             rows = conn.execute(query, (page_size, offset)).fetchall()
             if not rows:
                 break
 
-            for row in rows:
-                score_rows.append(score_record(row))
+            score_rows = [score_record(row) for row in rows]
+            conn.executemany(INSERT_SCORE_SQL, score_rows)
+
+            for sr in score_rows:
+                label_counts[sr[6]] += 1
 
             processed += len(rows)
             offset    += page_size
@@ -139,15 +143,8 @@ def run_relevance_scoring(
             if processed % 10000 == 0:
                 logger.info(f"  评分进度: {processed}")
 
-        # 批量写入
-        conn.executemany(INSERT_SCORE_SQL, score_rows)
-
     total = processed
     logger.info(f"待评分文献：{total} 篇")
-
-    label_counts = {"高相关": 0, "中相关": 0, "低相关": 0}
-    for row in score_rows:
-        label_counts[row[6]] += 1
 
     logger.info("评分完成，分布：")
     for label, cnt in label_counts.items():
@@ -191,21 +188,21 @@ def export_csv(db_path: Path = DB_PATH, out_dir: Path = OUTPUT_DIR) -> dict[str,
 
     output_paths: dict[str, Path] = {}
 
-    for label in ("高相关", "中相关", "低相关"):
-        safe_name  = {"高相关": "high", "中相关": "mid", "低相关": "low"}[label]
-        out_path   = out_dir / f"{safe_name}_relevance.csv"
+    with get_conn(db_path) as conn:
+        for label in ("高相关", "中相关", "低相关"):
+            safe_name  = {"高相关": "high", "中相关": "mid", "低相关": "low"}[label]
+            out_path   = out_dir / f"{safe_name}_relevance.csv"
 
-        with get_conn(db_path) as conn:
             rows = conn.execute(query, (label,)).fetchall()
 
-        with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(dict(row))
+            with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(dict(row))
 
-        logger.info(f"导出 {label} → {out_path}  ({len(rows)} 篇)")
-        output_paths[label] = out_path
+            logger.info(f"导出 {label} → {out_path}  ({len(rows)} 篇)")
+            output_paths[label] = out_path
 
     return output_paths
 
@@ -223,8 +220,6 @@ def write_clean_report(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "clean_report.txt"
-
-    from datetime import datetime
     lines = [
         "=" * 60,
         "马铃薯文献清洗报告",

@@ -26,7 +26,7 @@ import sqlite3
 from pathlib import Path
 from lxml import etree
 
-from config.settings import DB_PATH
+from config.settings import DB_PATH, RAW_XML_DIR
 from utils.db import init_db, get_conn
 from utils.logger import get_logger
 
@@ -264,7 +264,6 @@ def run_parse(xml_dir: Path = None, db_path: Path = DB_PATH) -> None:
     """
     遍历 xml_dir 下所有 batch_*.xml，全部解析写入 SQLite。
     """
-    from config.settings import RAW_XML_DIR
     xml_dir  = Path(xml_dir or RAW_XML_DIR)
     db_path  = Path(db_path)
 
