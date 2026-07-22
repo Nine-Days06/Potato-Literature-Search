@@ -92,52 +92,6 @@ EXCLUDED_ARTICLE_TYPES = [
     "Published Erratum", "Editorial", "News"
 ]
 
-# ── 软评分词典 ────────────────────────────────────────────────
-# 基因相关词汇
-GENE_TERMS = [
-    "gene", "genes", "allele", "alleles", "locus", "loci",
-    "QTL", "SNP", "SNPs", "haplotype", "haplotypes",
-    "transcript", "transcription", "mRNA", "promoter",
-    "regulatory", "overexpression", "knockout", "knockdown",
-    "CRISPR", "RNAi", "siRNA", "mutation", "mutations",
-    "polymorphism", "genotype", "genome", "genomic",
-    "marker", "markers", "SSR", "microsatellite",
-    "protein", "enzyme", "kinase", "transcription factor",
-    "cloning", "sequencing", "expression",
-]
-
-# 功能/机制相关词汇
-FUNCTION_TERMS = [
-    "function", "functional", "pathway", "pathways",
-    "expression", "regulation", "regulated", "interaction",
-    "biosynthesis", "metabolism", "metabolic", "signaling",
-    "signal transduction", "enzyme activity", "catalysis",
-    "phosphorylation", "methylation", "acetylation",
-    "binding", "receptor", "activation", "inhibition",
-    "response", "mechanism", "characterization",
-]
-
-# 性状/表型相关词汇
-TRAIT_TERMS = [
-    "yield", "tuber", "tubers", "starch", "starch content",
-    "disease resistance", "blight", "late blight", "early blight",
-    "drought", "drought tolerance", "cold tolerance", "heat stress",
-    "flesh color", "skin color", "glycoalkaloid", "solanine",
-    "anthocyanin", "phenotype", "phenotypic", "agronomic",
-    "maturity", "dormancy", "sprouting", "storage",
-    "quality", "nutritional", "protein content", "iron",
-    "vitamin", "antioxidant", "flavor", "texture",
-    "pathogen", "virus", "bacterial", "fungal",
-    "Phytophthora", "Alternaria", "nematode", "aphid",
-    "biomass", "growth", "development",
-]
-
-# 相关性分级阈值
-# 三类都命中且总分 >= HIGH_SCORE_THRESHOLD → 高相关
-HIGH_SCORE_THRESHOLD = 5
-# 三类都命中 或 总分 >= MID_SCORE_THRESHOLD → 中相关
-MID_SCORE_THRESHOLD  = 3
-
 # ── LLM 验证配置 ──────────────────────────────────────────────
 LLM_PROVIDER    = "zhipu"          # "deepseek" | "zhipu" | "openai"
 

@@ -2,7 +2,7 @@
 """
 PMC Open Access PDF 下载器
 流程：
-  1. 从数据库读取高/中相关且带有 PMC ID 的文献。
+  1. 从数据库读取 LLM 判定相关的带有 PMC ID 的文献。
   2. 调用 PMC OA API 获取这些 PMC ID 对应的 PDF 下载链接。
   3. 转换为 HTTPS 链接并下载到指定目录。
   4. 支持断点续传（跳过已存在文件）。
@@ -22,8 +22,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import (
-    DB_PATH, PMC_OA_API, 
-    PDF_HIGH_DIR, PDF_MID_DIR, PDF_LOW_DIR,
+    DB_PATH, PMC_OA_API, PDF_DIR,
     REQUEST_INTERVAL, OUTPUT_DIR
 )
 from utils.db import get_conn
@@ -321,7 +320,7 @@ def export_oa_links_csv(
 
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["pmid", "pmc_id", "label", "pdf_url", "tgz_url"])
+        writer.writerow(["pmid", "pmc_id", "pdf_url", "tgz_url"])
 
         for pmc_id in sorted(oa_links.keys()):
             info = pmc_to_info.get(pmc_id, {})
@@ -329,7 +328,6 @@ def export_oa_links_csv(
             writer.writerow([
                 info.get("pmid", ""),
                 pmc_id,
-                info.get("label", ""),
                 links.get("pdf", ""),
                 links.get("tgz", ""),
             ])
@@ -342,7 +340,7 @@ def export_failed_links_csv(
 ) -> Path:
     """
     导出下载失败的链接清单（CSV），方便人工核查或补下载。
-    每行包含 pmid、pmc_id、label、pdf_url、tgz_url、error 类型。
+    每行包含 pmid、pmc_id、pdf_url、tgz_url、error 类型。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -350,13 +348,12 @@ def export_failed_links_csv(
 
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["pmid", "pmc_id", "label", "pdf_url", "tgz_url"])
+        writer.writerow(["pmid", "pmc_id", "pdf_url", "tgz_url"])
         for item in failed_items:
             links = item["links"]
             writer.writerow([
                 item.get("pmid", ""),
                 item.get("pmc_id", ""),
-                item.get("label", ""),
                 links.get("pdf", "") if links else "",
                 links.get("tgz", "") if links else "",
             ])
@@ -603,10 +600,10 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
 
     # 1. 查找高/中相关且有 PMC ID 的文献
     query = """
-    SELECT a.pmid, a.pmc_id, s.label
+    SELECT a.pmid, a.pmc_id
     FROM articles a
-    JOIN relevance_scores s ON a.pmid = s.pmid
-    WHERE (s.label = '高相关' OR s.label = '中相关' OR s.label = '低相关')
+    JOIN llm_validation v ON a.pmid = v.pmid
+    WHERE (v.human_review = 'Y' OR (v.human_review IS NULL AND v.llm_verdict = 'RELEVANT'))
       AND a.pmc_id IS NOT NULL AND a.pmc_id != ''
     """
     
@@ -614,7 +611,7 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
         records = conn.execute(query).fetchall()
         
     if not records:
-        logger.info("未发现符合下载条件（有 PMC ID 且已评分）的文献。")
+        logger.info("未发现符合下载条件（有 PMC ID 且 LLM 判定相关）的文献。")
         return
 
     prefer_format = prefer_format.lower().strip()
@@ -632,7 +629,7 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
         if not pid:
             invalid_pmc_count += 1
             continue
-        pmc_to_info[pid] = {"pmid": r["pmid"], "label": r["label"]}
+        pmc_to_info[pid] = {"pmid": r["pmid"]}
 
     if invalid_pmc_count:
         logger.warning(f"已跳过 {invalid_pmc_count} 条格式无效的 PMC ID。")
@@ -665,7 +662,7 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
         future_to_meta: dict = {}
         for pmc_id, links in oa_links.items():
             info = pmc_to_info[pmc_id]
-            dest_dir = {"高相关": PDF_HIGH_DIR, "中相关": PDF_MID_DIR, "低相关": PDF_LOW_DIR}[info["label"]]
+            dest_dir = PDF_DIR
             pdf_path = dest_dir / f"{info['pmid']}.pdf"
             txt_path = dest_dir / f"{info['pmid']}.txt"
 
@@ -680,8 +677,7 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
                 "txt_path": txt_path,
                 "prefer_format": prefer_format,
                 "pmid": info["pmid"],
-                "label": info["label"],
-            }
+                }
             future = executor.submit(
                 download_with_fallback,
                 links,
@@ -758,4 +754,4 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
     else:
         logger.info("所有下载任务均已成功完成。")
 
-    logger.info(f"存储位置: {PDF_HIGH_DIR} 和 {PDF_MID_DIR}")
+    logger.info(f"存储位置: {PDF_DIR}")

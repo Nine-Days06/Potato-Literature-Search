@@ -295,8 +295,8 @@ class TestExportOaLinksCsv(unittest.TestCase):
             "PMC2": {"tgz": "https://example.org/2.tgz"},
         }
         pmc_to_info = {
-            "PMC1": {"pmid": "111", "label": "高相关"},
-            "PMC2": {"pmid": "222", "label": "中相关"},
+            "PMC1": {"pmid": "111"},
+            "PMC2": {"pmid": "222"},
         }
 
         with tempfile.TemporaryDirectory() as td:
@@ -309,7 +309,7 @@ class TestExportOaLinksCsv(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["pmid"], "111")
         self.assertEqual(rows[0]["pmc_id"], "PMC1")
-        self.assertEqual(rows[0]["label"], "高相关")
+        
         self.assertEqual(rows[0]["pdf_url"], "https://example.org/1.pdf")
         self.assertEqual(rows[1]["tgz_url"], "https://example.org/2.tgz")
 

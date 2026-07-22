@@ -52,7 +52,6 @@ CREATE TABLE IF NOT EXISTS relevance_scores (
 CREATE_LLM_VALIDATION_SQL = """
 CREATE TABLE IF NOT EXISTS llm_validation (
     pmid             TEXT PRIMARY KEY,
-    relevance_label  TEXT,      -- 原始评分标签（高/中/低）
     llm_verdict      TEXT,      -- RELEVANT / NOT_RELEVANT
     reason           TEXT,      -- LLM 判断理由
     validated_at     TEXT,      -- 验证时间
@@ -68,7 +67,6 @@ def init_db(db_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute(CREATE_ARTICLES_SQL)
         conn.execute(CREATE_FILTER_LOG_SQL)
-        conn.execute(CREATE_SCORES_SQL)
         conn.execute(CREATE_LLM_VALIDATION_SQL)
         conn.commit()
 

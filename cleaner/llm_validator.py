@@ -309,8 +309,8 @@ SYSTEM_PROMPT = (
 
 INSERT_SQL = """
 INSERT OR REPLACE INTO llm_validation
-    (pmid, relevance_label, llm_verdict, reason, validated_at)
-VALUES (?, ?, ?, ?, ?)
+    (pmid, llm_verdict, reason, validated_at)
+VALUES (?, ?, ?, ?)
 """
 
 UPDATE_HUMAN_REVIEW_SQL = """
@@ -437,12 +437,10 @@ def run_validation():
     else:
         with get_conn(DB_PATH) as conn:
             rows = conn.execute("""
-                SELECT a.pmid, a.title, a.abstract, s.label
+                SELECT a.pmid, a.title, a.abstract
                 FROM articles a
-                JOIN relevance_scores s ON a.pmid = s.pmid
                 WHERE a.abstract IS NOT NULL AND a.abstract != ''
                   AND a.pmid NOT IN (SELECT pmid FROM llm_validation)
-                ORDER BY s.total_score DESC
             """).fetchall()
 
         if not rows:
@@ -573,7 +571,7 @@ def _export_review_csv() -> Path | None:
     with get_conn(DB_PATH) as conn:
         rows = conn.execute("""
             SELECT v.pmid, a.title, a.abstract,
-                   v.relevance_label, v.llm_verdict, v.reason
+                   v.llm_verdict, v.reason
             FROM llm_validation v
             JOIN articles a ON a.pmid = v.pmid
             WHERE v.human_review IS NULL
@@ -678,15 +676,11 @@ def _export_filtered_csv() -> Path | None:
             SELECT a.pmid, a.title, a.abstract, a.keywords, a.mesh_terms,
                    a.pub_year, a.journal, a.doi, a.pmc_id,
                    a.article_types, a.authors, a.affiliation, a.language,
-                   s.gene_hits, s.function_hits, s.trait_hits,
-                   s.total_score, s.has_all_three, s.label AS relevance_label,
                    v.llm_verdict, v.reason, v.human_review
             FROM articles a
-            JOIN relevance_scores s ON a.pmid = s.pmid
             JOIN llm_validation v ON a.pmid = v.pmid
             WHERE v.human_review = 'Y'
                OR (v.human_review IS NULL AND v.llm_verdict = 'RELEVANT')
-            ORDER BY s.total_score DESC
         """).fetchall()
 
     if not rows:
