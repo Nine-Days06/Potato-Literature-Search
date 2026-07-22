@@ -148,7 +148,7 @@ DEEPSEEK_MODEL    = "deepseek-v4-flash"
 
 # 智谱AI（原生 zhipuai SDK）
 ZHIPU_API_KEY   = os.environ.get("ZHIPU_API_KEY", "")
-ZHIPU_MODEL     = "glm-4.7-flash"
+ZHIPU_MODEL     = "glm-4-Flash-250414"
 
 # 其他 OpenAI 兼容 API（如 OpenAI、SiliconFlow、vLLM 等）
 OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
