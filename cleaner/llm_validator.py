@@ -476,6 +476,7 @@ def run_validation():
                 executor.submit(_call_llm, batch): batch
                 for batch in batches
             }
+            completed = 0
             for future in as_completed(future_to_batch):
                 batch = future_to_batch[future]
                 batch_num = batches.index(batch) + 1
@@ -484,6 +485,7 @@ def run_validation():
                 except Exception as e:
                     logger.error(f"  批次 {batch_num}/{round_batches} 异常: {e}")
                     round_failed.extend(batch)
+                    completed += 1
                     continue
 
                 failed_set = set(failed_pmids)
@@ -509,6 +511,11 @@ def run_validation():
                     all_validated.extend(log_rows)
                 else:
                     round_failed.extend(batch)
+
+                completed += 1
+                logger.info(f"  [{completed}/{round_batches}] "
+                            f"批次 {batch_num} 完成"
+                            f"({'成功' if results else '全部失败'})")
 
 
 
