@@ -156,6 +156,7 @@ OPENAI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 OPENAI_MODEL    = "qwen3.7-plus"
 
 LLM_BATCH_SIZE  = 5                     # 每次调用验证的文献数量
+LLM_CONCURRENCY = 2                     # 并行发送的批次数（同时进行的 API 调用数）
 LLM_MAX_TOKENS  = 8192                   # 每次 API 调用的最大 token 数
 LLM_MAX_RETRIES = 3                     # 单次 API 调用重试次数（指数退避 2s/4s/8s）
 LLM_MAX_ROUNDS  = 2                     # 轮次重试次数（初始 1 轮 + 额外重试轮数）

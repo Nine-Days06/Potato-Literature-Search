@@ -11,12 +11,13 @@ import csv
 import os
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from openai import OpenAI
 
 from config.settings import (
     DB_PATH, OUTPUT_DIR, LOG_DIR,
-    LLM_BATCH_SIZE, LLM_MAX_TOKENS, LLM_MAX_RETRIES, LLM_MAX_ROUNDS,
+    LLM_BATCH_SIZE, LLM_CONCURRENCY, LLM_MAX_TOKENS, LLM_MAX_RETRIES, LLM_MAX_ROUNDS,
     LLM_PROVIDER, LLM_PROVIDER_CONFIGS,
 )
 from utils import now_iso
@@ -464,38 +465,50 @@ def run_validation():
                     f"{round_batches} 批 ---")
 
         round_failed = []
-
+        batches = []
         for start in range(0, len(remaining_rows), LLM_BATCH_SIZE):
             batch = remaining_rows[start:start + LLM_BATCH_SIZE]
-            batch_num = start // LLM_BATCH_SIZE + 1
-            logger.info(f"  批次 {batch_num}/{round_batches} "
-                        f"({len(batch)} 篇)...")
+            batches.append(batch)
+        logger.info(f"  共 {round_batches} 批, 并发 {LLM_CONCURRENCY} 路")
 
-            results, failed_pmids = _call_llm(batch)
-            failed_set = set(failed_pmids)
+        with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as executor:
+            future_to_batch = {
+                executor.submit(_call_llm, batch): batch
+                for batch in batches
+            }
+            for future in as_completed(future_to_batch):
+                batch = future_to_batch[future]
+                batch_num = batches.index(batch) + 1
+                try:
+                    results, failed_pmids = future.result()
+                except Exception as e:
+                    logger.error(f"  批次 {batch_num}/{round_batches} 异常: {e}")
+                    round_failed.extend(batch)
+                    continue
 
-            if results:
-                now = now_iso()
-                pmid_to_result = {r["pmid"]: r for r in results}
-                log_rows = []
-                for row in batch:
-                    pmid = row["pmid"]
-                    if pmid in failed_set:
-                        round_failed.append(row)
-                        continue
-                    r = pmid_to_result.get(pmid)
-                    if r is None:
-                        round_failed.append(row)
-                        continue
-                    log_rows.append((pmid, row["label"],
-                                     r.get("verdict", "UNKNOWN"),
-                                     r.get("reason", ""), now))
+                failed_set = set(failed_pmids)
+                if results:
+                    now = now_iso()
+                    pmid_to_result = {r["pmid"]: r for r in results}
+                    log_rows = []
+                    for row in batch:
+                        pmid = row["pmid"]
+                        if pmid in failed_set:
+                            round_failed.append(row)
+                            continue
+                        r = pmid_to_result.get(pmid)
+                        if r is None:
+                            round_failed.append(row)
+                            continue
+                        log_rows.append((pmid, row["label"],
+                                         r.get("verdict", "UNKNOWN"),
+                                         r.get("reason", ""), now))
 
-                with get_conn(DB_PATH) as conn:
-                    conn.executemany(INSERT_SQL, log_rows)
-                all_validated.extend(log_rows)
-            else:
-                round_failed.extend(batch)
+                    with get_conn(DB_PATH) as conn:
+                        conn.executemany(INSERT_SQL, log_rows)
+                    all_validated.extend(log_rows)
+                else:
+                    round_failed.extend(batch)
 
 
 
