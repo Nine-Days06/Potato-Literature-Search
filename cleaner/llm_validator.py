@@ -310,9 +310,13 @@ SYSTEM_PROMPT = (
 )
 
 INSERT_SQL = """
-INSERT OR REPLACE INTO llm_validation
-    (pmid, llm_verdict, reason, validated_at)
-VALUES (?, ?, ?, ?)
+INSERT INTO llm_validation
+    (pmid, llm_verdict, reason, validated_at, human_review)
+VALUES (?, ?, ?, ?, NULL)
+ON CONFLICT(pmid) DO UPDATE SET
+    llm_verdict = excluded.llm_verdict,
+    reason = excluded.reason,
+    validated_at = excluded.validated_at
 """
 
 UPDATE_HUMAN_REVIEW_SQL = """
