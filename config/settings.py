@@ -103,6 +103,7 @@ DEEPSEEK_MODEL    = "deepseek-v4-flash"
 # 智谱AI（原生 zhipuai SDK）
 ZHIPU_API_KEY   = os.environ.get("ZHIPU_API_KEY", "")
 ZHIPU_MODEL     = "glm-4-Flash-250414"
+ZHIPU_BATCH_MODEL = "glm-4-flash"      # Batch API 使用的模型（价格 50% off）
 
 # 其他 OpenAI 兼容 API（如 OpenAI、SiliconFlow、vLLM 等）
 OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
@@ -111,9 +112,14 @@ OPENAI_MODEL    = "qwen3.7-plus"
 
 LLM_BATCH_SIZE  = 5                     # 每次调用验证的文献数量
 LLM_CONCURRENCY = 2                     # 并行发送的批次数（同时进行的 API 调用数）
-LLM_MAX_TOKENS  = 8192                   # 每次 API 调用的最大 token 数
+LLM_MAX_TOKENS  = 8192                  # 每次 API 调用的最大 token 数
 LLM_MAX_RETRIES = 3                     # 单次 API 调用重试次数（指数退避 2s/4s/8s）
 LLM_MAX_ROUNDS  = 2                     # 轮次重试次数（初始 1 轮 + 额外重试轮数）
+
+# ── LLM Batch API 配置（仅 zhipu） ──
+LLM_BATCH_POLL_INTERVAL  = 30           # Batch 轮询间隔（秒）
+LLM_BATCH_TIMEOUT        = 86400        # Batch 超时时间（24h）
+LLM_BATCH_AUTO_DELETE    = True         # 完成后自动删除输入文件
 
 # Provider 配置字典 — 新增 provider 只需在此添加一项
 LLM_PROVIDER_CONFIGS = {

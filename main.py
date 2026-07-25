@@ -51,9 +51,9 @@ def step_pdf(prefer_format: str = "pdf"):
     run_pdf_download(db_path=DB_PATH, prefer_format=prefer_format)
 
 
-def step_validate():
+def step_validate(batch=False):
     from cleaner.llm_validator import run_validation
-    run_validation()
+    run_validation(batch_mode=batch)
 
 
 def step_import_review(csv_path: str = None):
@@ -92,6 +92,11 @@ def main():
         default=None,
         help="import-review 阶段的 CSV 文件路径（默认自动查找最新的复核文件）",
     )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="使用智谱 Batch API 进行 LLM 验证（仅 zhipu provider 有效）",
+    )
     args = parser.parse_args()
 
     # 初始化目录和数据库
@@ -118,7 +123,7 @@ def main():
         step_pdf(args.prefer_format)
 
     if step == "validate":
-        step_validate()
+        step_validate(args.batch)
 
     if step == "import-review":
         step_import_review(args.csv)

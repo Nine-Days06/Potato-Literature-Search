@@ -10,6 +10,7 @@
 - **二级过滤** — 硬过滤（规则引擎）→ LLM 验证（多 Provider）
 - **断点续传** — XML 批次自动跳过已下载文件；LLM 验证崩溃后可恢复
 - **多 Provider** — 支持 DeepSeek、智谱 GLM、OpenAI 兼容 API 三种 LLM 后端
+- **智谱 Batch API** — 异步批量验证，支持中断恢复与自动降级同步模式重试
 - **数据库复用连接** — 所有批处理操作复用单连接，减少连接开销
 
 ## 关于文献格式
@@ -114,6 +115,9 @@ python main.py --step validate
 # 5. 导入人工复核结果（在导出的 CSV 中标注 Y/N 后）
 python main.py --step import-review
 
+# 批量验证（智谱专用，异步处理大文献集）
+python main.py --step validate --batch
+
 # 6. 下载 OA 全文 PDF/TXT
 python main.py --step pdf                     # 默认 pdf 格式
 python main.py --step pdf --prefer-format txt   # 优先下载纯文本
@@ -136,8 +140,11 @@ python main.py --step clean
 python main.py --step pdf
 python main.py --step pdf --prefer-format txt
 
-# LLM 二次验证
+# LLM 二次验证（同步模式 5 篇/批）
 python main.py --step validate
+
+# LLM 二次验证（智谱 Batch API 异步模式，每篇独立请求）
+python main.py --step validate --batch
 
 # 导入人工复核 CSV（自动查找最新复核文件）
 python main.py --step import-review
@@ -153,6 +160,7 @@ python main.py --query "potato AND drought AND gene"
 | 参数 | 适用阶段 | 说明 |
 |------|----------|------|
 | `--step` | 全部 | 运行指定阶段（download / parse / clean / pdf / validate / import-review / all） |
+| `--batch` | validate | 使用智谱 Batch API 异步验证（仅 `LLM_PROVIDER=zhipu` 时生效，否则自动降级同步） |
 | `--query` | download / all | 自定义 PubMed 搜索词 |
 | `--xml-dir` | parse / all | XML 文件目录（默认 `data/raw_xml/`） |
 | `--prefer-format` | pdf | 优先下载格式（pdf / txt，默认 pdf） |
@@ -162,7 +170,7 @@ python main.py --query "potato AND drought AND gene"
 
 | 文件 | 说明 |
 |------|------|
-| `data/processed/potato_lit.db` | 全量结构化文献库（articles + filter_log + llm_validation 三张表） |
+| `data/processed/potato_lit.db` | 全量结构化文献库（articles + filter_log + llm_validation + batch_checkpoints 四张表） |
 | `data/output/llm_review_pending_*.csv` | LLM 验证待人工复核清单（标注 Y/N） |
 | `data/output/llm_validation_failed_*.csv` | LLM 校验失败 PMID 清单 |
 | `data/output/llm_filtered_*.csv` | LLM + 人工复核后的最终过滤结果 |

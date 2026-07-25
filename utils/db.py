@@ -37,18 +37,6 @@ CREATE TABLE IF NOT EXISTS filter_log (
 );
 """
 
-CREATE_SCORES_SQL = """
-CREATE TABLE IF NOT EXISTS relevance_scores (
-    pmid          TEXT PRIMARY KEY,
-    gene_hits     INTEGER,
-    function_hits INTEGER,
-    trait_hits    INTEGER,
-    total_score   INTEGER,
-    has_all_three INTEGER,    -- 0/1
-    label         TEXT        -- '高相关' / '中相关' / '低相关'
-);
-"""
-
 CREATE_LLM_VALIDATION_SQL = """
 CREATE TABLE IF NOT EXISTS llm_validation (
     pmid             TEXT PRIMARY KEY,
@@ -86,7 +74,7 @@ def get_conn(db_path: Path):
         conn.close()
 
 
-VALID_TABLES = {"articles", "filter_log", "relevance_scores", "llm_validation"}
+VALID_TABLES = {"articles", "filter_log", "llm_validation"}
 
 
 def get_all_pmids(db_path: Path) -> list[str]:
