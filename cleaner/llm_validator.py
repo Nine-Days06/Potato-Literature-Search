@@ -676,7 +676,7 @@ def _export_review_csv() -> Path | None:
             FROM llm_validation v
             JOIN articles a ON a.pmid = v.pmid
             WHERE v.human_review IS NULL
-            ORDER BY v.llm_verdict, a.pmid
+            ORDER BY v.llm_verdict DESC, a.pmid
         """).fetchall()
 
     if not rows:
