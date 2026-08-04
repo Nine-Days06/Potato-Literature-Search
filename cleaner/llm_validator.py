@@ -362,6 +362,9 @@ def _build_client() -> tuple:
 
     extra_kwargs = {k: v for k, v in cfg["extra_kwargs"].items()}
     extra_kwargs["model"] = cfg["model"]
+    extra_body = cfg.get("extra_body")
+    if extra_body:
+        extra_kwargs["extra_body"] = extra_body
 
     return client, cfg["model"], extra_kwargs, cfg["fix_multi_array"]
 
@@ -439,6 +442,36 @@ def run_validation(batch_mode: bool = False):
         return
 
     _run_sync_validation()
+
+
+def _build_log_rows(batch, pmid_to_result, failed_set, now):
+    """
+    将一批 LLM 结果整理为待入库 log_rows（4 元组：pmid, verdict, reason, now）
+    与失败列表。SQL 查询仅含 pmid/title/abstract，不依赖 label 列。
+    """
+    log_rows = []
+    round_failed = []
+    for row in batch:
+        pmid = row["pmid"]
+        if pmid in failed_set:
+            round_failed.append(row)
+            continue
+        r = pmid_to_result.get(pmid)
+        if r is None:
+            round_failed.append(row)
+            continue
+        log_rows.append((pmid,
+                         r.get("verdict", "UNKNOWN"),
+                         r.get("reason", ""), now))
+    return log_rows, round_failed
+
+
+def _count_verdicts(validated_rows: list) -> dict:
+    """统计 log_rows（4 元组: pmid, verdict, reason, now）中各 verdict 数量"""
+    verdicts = {}
+    for _, v, _, _ in validated_rows:
+        verdicts[v] = verdicts.get(v, 0) + 1
+    return verdicts
 
 
 def _run_sync_validation():
@@ -521,23 +554,15 @@ def _run_sync_validation():
                 if results:
                     now = now_iso()
                     pmid_to_result = {r["pmid"]: r for r in results}
-                    log_rows = []
-                    for row in batch:
-                        pmid = row["pmid"]
-                        if pmid in failed_set:
-                            round_failed.append(row)
-                            continue
-                        r = pmid_to_result.get(pmid)
-                        if r is None:
-                            round_failed.append(row)
-                            continue
-                        log_rows.append((pmid, row["label"],
-                                         r.get("verdict", "UNKNOWN"),
-                                         r.get("reason", ""), now))
+                    log_rows, batch_failed = _build_log_rows(
+                        batch, pmid_to_result, failed_set, now
+                    )
+                    round_failed.extend(batch_failed)
 
-                    with get_conn(DB_PATH) as conn:
-                        conn.executemany(INSERT_SQL, log_rows)
-                    all_validated.extend(log_rows)
+                    if log_rows:
+                        with get_conn(DB_PATH) as conn:
+                            conn.executemany(INSERT_SQL, log_rows)
+                        all_validated.extend(log_rows)
                 else:
                     round_failed.extend(batch)
 
@@ -566,9 +591,7 @@ def _run_sync_validation():
         logger.warning("所有批次均验证失败，请检查 API 配置")
         return
 
-    verdicts = {}
-    for _, _, v, _, _ in all_validated:
-        verdicts[v] = verdicts.get(v, 0) + 1
+    verdicts = _count_verdicts(all_validated)
     logger.info("LLM 验证统计:")
     for v, c in sorted(verdicts.items()):
         pct = c / len(all_validated) * 100
@@ -624,19 +647,10 @@ def _run_sync_validation_for_pmids(pmid_list: list):
                 if results:
                     now = now_iso()
                     pmid_to_result = {r["pmid"]: r for r in results}
-                    log_rows = []
-                    for row in batch:
-                        pmid = row["pmid"]
-                        if pmid in failed_set:
-                            round_failed.append(row)
-                            continue
-                        r = pmid_to_result.get(pmid)
-                        if r is None:
-                            round_failed.append(row)
-                            continue
-                        log_rows.append((pmid, row.get("label"),
-                                         r.get("verdict", "UNKNOWN"),
-                                         r.get("reason", ""), now))
+                    log_rows, batch_failed = _build_log_rows(
+                        batch, pmid_to_result, failed_set, now
+                    )
+                    round_failed.extend(batch_failed)
                     if log_rows:
                         with get_conn(DB_PATH) as conn:
                             conn.executemany(INSERT_SQL, log_rows)

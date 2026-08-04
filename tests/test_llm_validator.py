@@ -1,5 +1,6 @@
 import unittest
 import json
+import sqlite3
 import tempfile
 import os
 from pathlib import Path
@@ -8,6 +9,8 @@ from cleaner.llm_validator import (
     _build_per_article_prompt,
     _build_jsonl,
     _parse_batch_results,
+    _build_log_rows,
+    _count_verdicts,
 )
 
 
@@ -260,6 +263,67 @@ class TestParseBatchResults(unittest.TestCase):
         self.assertEqual(success, 1)
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0], "ERR1")
+
+
+class TestBuildLogRows(unittest.TestCase):
+    """回归测试：SQL 查询不再返回 label 列，log_rows 必须为 4 元组"""
+
+    def _make_sql_rows(self, pmids: list[str]):
+        """模拟同步验证的查询结果（仅 pmid/title/abstract 三列）"""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE t (pmid TEXT, title TEXT, abstract TEXT)")
+        for p in pmids:
+            conn.execute("INSERT INTO t VALUES (?, 't', 'a')", (p,))
+        rows = conn.execute("SELECT pmid, title, abstract FROM t").fetchall()
+        conn.close()
+        return rows
+
+    def test_rows_without_label_column(self):
+        batch = self._make_sql_rows(["1", "2"])
+        pmid_to_result = {
+            "1": {"pmid": "1", "verdict": "RELEVANT", "reason": "r1"},
+            "2": {"pmid": "2", "verdict": "NOT_RELEVANT", "reason": "r2"},
+        }
+        log_rows, failed = _build_log_rows(batch, pmid_to_result, set(), "now")
+        self.assertEqual(len(log_rows), 2)
+        self.assertEqual(failed, [])
+        for row in log_rows:
+            self.assertEqual(len(row), 4)
+        self.assertEqual(log_rows[0], ("1", "RELEVANT", "r1", "now"))
+
+    def test_failed_pmids_are_collected(self):
+        batch = self._make_sql_rows(["1", "2", "3"])
+        pmid_to_result = {"1": {"pmid": "1", "verdict": "RELEVANT"}}
+        log_rows, failed = _build_log_rows(
+            batch, pmid_to_result, {"2"}, "now"
+        )
+        self.assertEqual(len(log_rows), 1)
+        self.assertEqual([r["pmid"] for r in failed], ["2", "3"])
+
+    def test_missing_verdict_defaults_unknown(self):
+        batch = self._make_sql_rows(["1"])
+        pmid_to_result = {"1": {"pmid": "1"}}
+        log_rows, failed = _build_log_rows(batch, pmid_to_result, set(), "now")
+        self.assertEqual(log_rows[0][1], "UNKNOWN")
+
+
+class TestCountVerdicts(unittest.TestCase):
+    """回归测试：log_rows 为 4 元组，统计解包不能按 5 元组"""
+
+    def test_counts_four_tuple_rows(self):
+        rows = [
+            ("1", "RELEVANT", "r1", "now"),
+            ("2", "NOT_RELEVANT", "r2", "now"),
+            ("3", "RELEVANT", "r3", "now"),
+        ]
+        self.assertEqual(
+            _count_verdicts(rows),
+            {"RELEVANT": 2, "NOT_RELEVANT": 1},
+        )
+
+    def test_empty(self):
+        self.assertEqual(_count_verdicts([]), {})
 
 
 if __name__ == "__main__":

@@ -20,10 +20,7 @@ OUTPUT_DIR  = DATA_DIR / "output"
 LOG_DIR     = BASE_DIR / "logs"
 
 # PDF 存储路径
-PDF_DIR      = DATA_DIR / "pdfs"
-PDF_HIGH_DIR = PDF_DIR / "high"
-PDF_MID_DIR  = PDF_DIR / "mid"
-PDF_LOW_DIR  = PDF_DIR / "low"
+PDF_DIR = DATA_DIR / "pdfs"
 
 DB_PATH     = PROC_DIR / "potato_lit.db"
 
@@ -142,6 +139,9 @@ LLM_PROVIDER_CONFIGS = {
             "temperature": 0, "max_tokens": LLM_MAX_TOKENS,
             "timeout": 120, "response_format": {"type": "json_object"},
         },
+        # V4 模型思考模式默认开启：temperature 不生效、思考 token 占用输出预算
+        # 可能导致 JSON 截断，显式关闭
+        "extra_body": {"thinking": {"type": "disabled"}},
         "fix_multi_array": False,
     },
     "openai": {
