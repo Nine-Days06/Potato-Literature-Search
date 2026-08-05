@@ -11,6 +11,7 @@ from cleaner.llm_validator import (
     _parse_batch_results,
     _build_log_rows,
     _count_verdicts,
+    _normalize_verdict,
 )
 
 
@@ -264,6 +265,25 @@ class TestParseBatchResults(unittest.TestCase):
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0], "ERR1")
 
+    def test_parse_unrecognized_verdict_counts_as_failed(self):
+        """verdict 缺失或非标准 → 判失败重试，不入库 UNKNOWN"""
+        for content in (
+            '{"pmid":"X1","reason":"no verdict"}',
+            '{"pmid":"X2","verdict":"maybe","reason":"bad verdict"}',
+        ):
+            item = {
+                "custom_id": content.split('"pmid":"')[1].split('"')[0],
+                "response": {
+                    "status_code": 200,
+                    "body": {"choices": [{"message": {"content": content}}]}
+                }
+            }
+            path = self._make_result_jsonl([item])
+            from cleaner.llm_validator import _parse_batch_results as parser
+            success, failed = parser(path)
+            self.assertEqual(success, 0, content)
+            self.assertEqual(len(failed), 1, content)
+
 
 class TestBuildLogRows(unittest.TestCase):
     """回归测试：SQL 查询不再返回 label 列，log_rows 必须为 4 元组"""
@@ -301,11 +321,46 @@ class TestBuildLogRows(unittest.TestCase):
         self.assertEqual(len(log_rows), 1)
         self.assertEqual([r["pmid"] for r in failed], ["2", "3"])
 
-    def test_missing_verdict_defaults_unknown(self):
+    def test_missing_verdict_goes_to_failed(self):
+        """verdict 缺失（截断残缺对象）→ 判失败重试，不入库 UNKNOWN"""
         batch = self._make_sql_rows(["1"])
-        pmid_to_result = {"1": {"pmid": "1"}}
+        pmid_to_result = {"1": {"pmid": "1", "reason": "only reason"}}
         log_rows, failed = _build_log_rows(batch, pmid_to_result, set(), "now")
-        self.assertEqual(log_rows[0][1], "UNKNOWN")
+        self.assertEqual(log_rows, [])
+        self.assertEqual([r["pmid"] for r in failed], ["1"])
+
+    def test_invalid_verdict_goes_to_failed(self):
+        batch = self._make_sql_rows(["1"])
+        pmid_to_result = {"1": {"pmid": "1", "verdict": "maybe"}}
+        log_rows, failed = _build_log_rows(batch, pmid_to_result, set(), "now")
+        self.assertEqual(log_rows, [])
+        self.assertEqual([r["pmid"] for r in failed], ["1"])
+
+    def test_lowercase_verdict_normalized(self):
+        batch = self._make_sql_rows(["1"])
+        pmid_to_result = {"1": {"pmid": "1", "verdict": "relevant"}}
+        log_rows, _ = _build_log_rows(batch, pmid_to_result, set(), "now")
+        self.assertEqual(log_rows[0][1], "RELEVANT")
+
+
+class TestNormalizeVerdict(unittest.TestCase):
+
+    def test_standard_values(self):
+        self.assertEqual(_normalize_verdict("RELEVANT"), "RELEVANT")
+        self.assertEqual(_normalize_verdict("NOT_RELEVANT"), "NOT_RELEVANT")
+
+    def test_case_insensitive(self):
+        self.assertEqual(_normalize_verdict("relevant"), "RELEVANT")
+        self.assertEqual(_normalize_verdict("Not Relevant"), "NOT_RELEVANT")
+
+    def test_variants(self):
+        self.assertEqual(_normalize_verdict("Irrelevant"), "NOT_RELEVANT")
+        self.assertEqual(_normalize_verdict("not_relevant"), "NOT_RELEVANT")
+
+    def test_unrecognized_returns_none(self):
+        self.assertIsNone(_normalize_verdict("maybe"))
+        self.assertIsNone(_normalize_verdict(""))
+        self.assertIsNone(_normalize_verdict(None))
 
 
 class TestCountVerdicts(unittest.TestCase):

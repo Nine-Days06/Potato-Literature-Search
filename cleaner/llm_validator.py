@@ -444,10 +444,25 @@ def run_validation(batch_mode: bool = False):
     _run_sync_validation()
 
 
+def _normalize_verdict(value) -> str | None:
+    """
+    将 LLM 返回的 verdict 归一化为标准值（RELEVANT / NOT_RELEVANT）。
+    无法识别（缺失、截断残缺、其他取值）返回 None，由调用方判为失败重试。
+    """
+    if not value:
+        return None
+    compact = str(value).strip().upper().replace(" ", "").replace("-", "").replace("_", "")
+    if compact == "RELEVANT":
+        return "RELEVANT"
+    if compact in ("NOTRELEVANT", "IRRELEVANT"):
+        return "NOT_RELEVANT"
+    return None
+
+
 def _build_log_rows(batch, pmid_to_result, failed_set, now):
     """
     将一批 LLM 结果整理为待入库 log_rows（4 元组：pmid, verdict, reason, now）
-    与失败列表。SQL 查询仅含 pmid/title/abstract，不依赖 label 列。
+    与失败列表。verdict 缺失或非标准视为解析失败（回退重试），不写 UNKNOWN。
     """
     log_rows = []
     round_failed = []
@@ -460,9 +475,11 @@ def _build_log_rows(batch, pmid_to_result, failed_set, now):
         if r is None:
             round_failed.append(row)
             continue
-        log_rows.append((pmid,
-                         r.get("verdict", "UNKNOWN"),
-                         r.get("reason", ""), now))
+        verdict = _normalize_verdict(r.get("verdict"))
+        if verdict is None:
+            round_failed.append(row)
+            continue
+        log_rows.append((pmid, verdict, r.get("reason", ""), now))
     return log_rows, round_failed
 
 
@@ -885,7 +902,14 @@ def _parse_batch_results(jsonl_path: str) -> tuple[int, list[str]]:
                 failed_pmids.append(pmid)
                 continue
 
-            verdict = obj.get("verdict", "UNKNOWN")
+            verdict = _normalize_verdict(obj.get("verdict"))
+            if verdict is None:
+                logger.warning(
+                    f"Batch 结果 verdict 无法识别（判为失败重试）: "
+                    f"pmid={pmid}, verdict={obj.get('verdict')!r}"
+                )
+                failed_pmids.append(pmid)
+                continue
             reason = obj.get("reason", "")
             now = now_iso()
 
