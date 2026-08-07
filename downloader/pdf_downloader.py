@@ -13,6 +13,7 @@ import re
 import tarfile
 import io
 import csv
+import json
 import subprocess
 import requests
 from pathlib import Path
@@ -31,7 +32,6 @@ from utils.logger import get_logger
 logger = get_logger("pdf_downloader")
 
 MIN_VALID_FILE_BYTES = 1024
-MIN_VALID_TEXT_CHARS = 200
 
 OA_FETCH_MAX_WORKERS = 8
 DOWNLOAD_MAX_WORKERS = 8
@@ -39,6 +39,8 @@ OA_LINKS_CACHE_GLOB = "oa_download_links_*.csv"
 ARIA2C_CONNECT_PER_SERVER = "8"
 ARIA2C_SPLIT = "8"
 ARIA2C_MIN_SPLIT_SIZE = "1M"
+PDF_CHECKPOINT_FILENAME = "pdf_download_progress.json"
+RETRY_CHECKPOINT_INTERVAL = 10
 
 # ── API 调用与解析 ───────────────────────────────────────────
 
@@ -361,6 +363,75 @@ def export_failed_links_csv(
     return csv_path
 
 
+# ── PDF 下载 checkpoint ──────────────────────────────────────
+
+def _pdf_checkpoint_path() -> Path:
+    return Path(OUTPUT_DIR) / PDF_CHECKPOINT_FILENAME
+
+
+def _save_pdf_checkpoint(pending: list[dict]) -> None:
+    """保存待重试清单快照，崩溃后可恢复。"""
+    data = {"pending": pending, "updated_at": datetime.now().isoformat()}
+    path = _pdf_checkpoint_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    logger.info(f"检查点已保存: 待重试 {len(pending)} 篇")
+
+
+def _load_pdf_checkpoint() -> list[dict]:
+    """加载待重试清单；文件缺失或损坏返回空列表。"""
+    path = _pdf_checkpoint_path()
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("pending", [])
+    except Exception as e:
+        logger.warning(f"PDF 检查点读取失败，将从头开始: {e}")
+        return []
+
+
+def _clear_pdf_checkpoint():
+    """全部完成后删除检查点。"""
+    path = _pdf_checkpoint_path()
+    if path.exists():
+        path.unlink()
+        logger.info("PDF 检查点已清除（全部重试完成）")
+
+
+def load_failed_items_from_csv(out_dir: Path = OUTPUT_DIR) -> list[dict]:
+    """从最新 failed_downloads_*.csv 加载待重试清单。"""
+    csv_files = sorted(Path(out_dir).glob("failed_downloads_*.csv"), reverse=True)
+    if not csv_files:
+        logger.info("未找到失败下载清单 failed_downloads_*.csv")
+        return []
+
+    csv_file = csv_files[0]
+    logger.info(f"从失败清单加载重试项: {csv_file}")
+    items: list[dict] = []
+    try:
+        with open(csv_file, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                links: dict[str, str] = {}
+                pdf_url = normalize_pmc_asset_url(row.get("pdf_url", ""))
+                tgz_url = normalize_pmc_asset_url(row.get("tgz_url", ""))
+                if pdf_url:
+                    links["pdf"] = pdf_url
+                if tgz_url:
+                    links["tgz"] = tgz_url
+                items.append({
+                    "pmid": row.get("pmid", ""),
+                    "pmc_id": normalize_pmc_id(row.get("pmc_id", "")) or "",
+                    "links": links,
+                })
+    except Exception as e:
+        logger.warning(f"读取失败清单 CSV 失败: {csv_file} -> {e}")
+        return []
+    return items
+
+
 # ── 下载核心 ──────────────────────────────────────────────────
 
 def _run_aria2c_download(url: str, output_path: Path, timeout_sec: int = 300) -> bool:
@@ -444,72 +515,39 @@ def download_pdf_file(url: str, dest_path: Path) -> bool:
         return False
 
 
-def download_txt_from_tgz(url: str, dest_path: Path) -> bool:
+def _select_article_pdf_member(members: list) -> tarfile.TarInfo | None:
     """
-    从 OA tgz 包中提取正文并保存为 txt。
-    优先使用包内现成 txt；否则从 nxml/xml 提取纯文本。
+    从 OA tgz 包成员中选择正文 PDF。
+
+    PMC OA 包中正文 PDF 通常与 .nxml/.xml 文件同名（如 BCR-**.pdf 对应 BCR-**.nxml），
+    而配图/表格等补充材料 PDF 命名不同（如 *-s001.pdf）。按 stem 优先匹配可避免取错。
     """
-    if dest_path.exists() and dest_path.stat().st_size > MIN_VALID_FILE_BYTES:
-        return True
+    pdf_members = [
+        m for m in members if m.isfile() and m.name.lower().endswith(".pdf")
+    ]
+    if not pdf_members:
+        return None
+    if len(pdf_members) == 1:
+        return pdf_members[0]
 
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = dest_path.with_suffix(".txt.part")
-    tgz_temp_path = dest_path.with_suffix(".tgz.part")
+    xml_stems = {
+        Path(m.name).stem
+        for m in members
+        if m.isfile() and m.name.lower().endswith((".nxml", ".xml"))
+    }
+    if xml_stems:
+        for pdf in pdf_members:
+            if Path(pdf.name).stem in xml_stems:
+                return pdf
 
-    try:
-        text_content = ""
-        if not _run_aria2c_download(url, tgz_temp_path):
-            raise RuntimeError("aria2c 下载 tgz 失败")
-
-        with tarfile.open(tgz_temp_path, mode="r:gz") as tar:
-            txt_member = None
-            xml_member = None
-            for member in tar.getmembers():
-                lower_name = member.name.lower()
-                if member.isfile() and lower_name.endswith(".txt"):
-                    txt_member = member
-                    break
-                if member.isfile() and (lower_name.endswith(".nxml") or lower_name.endswith(".xml")):
-                    xml_member = xml_member or member
-
-            if txt_member is not None:
-                extracted = tar.extractfile(txt_member)
-                if extracted is not None:
-                    text_content = extracted.read().decode("utf-8", errors="ignore")
-            elif xml_member is not None:
-                extracted = tar.extractfile(xml_member)
-                if extracted is not None:
-                    xml_bytes = extracted.read()
-                    parser = etree.XMLParser(recover=True)
-                    root = etree.fromstring(xml_bytes, parser=parser)
-                    chunks = [s.strip() for s in root.itertext() if s and s.strip()]
-                    text_content = "\n".join(chunks)
-
-        if len(text_content) <= MIN_VALID_TEXT_CHARS:
-            raise RuntimeError("提取到的正文过短，疑似无效内容")
-
-        with open(temp_path, "w", encoding="utf-8") as f:
-            f.write(text_content)
-
-        temp_path.replace(dest_path)
-        return True
-
-    except Exception as e:
-        logger.error(f"  TXT 提取失败: {url} -> {e}")
-        if temp_path.exists():
-            temp_path.unlink()
-        if dest_path.exists() and dest_path.stat().st_size <= 1024:
-            dest_path.unlink()
-        return False
-    finally:
-        if tgz_temp_path.exists():
-            tgz_temp_path.unlink()
+    return pdf_members[0]
 
 
 def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
     """
     从 OA tgz 包中提取 PDF，并保存为 .pdf。
-    当 `oa.fcgi` 未返回 pdf 直链但包内包含 PDF 时可作为回退策略。
+    当 `oa.fcgi` 未返回 pdf 直链但包内已有 PDF 时可作为回退策略。
+    包内有多个 PDF 时优先选择与 .nxml/.xml 同名的正文 PDF。
     """
     if dest_path.exists() and dest_path.stat().st_size > MIN_VALID_FILE_BYTES:
         return True
@@ -524,11 +562,7 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
             raise RuntimeError("aria2c 下载 tgz 失败")
 
         with tarfile.open(tgz_temp_path, mode="r:gz") as tar:
-            pdf_member = None
-            for member in tar.getmembers():
-                if member.isfile() and member.name.lower().endswith(".pdf"):
-                    pdf_member = member
-                    break
+            pdf_member = _select_article_pdf_member(tar.getmembers())
 
             if pdf_member is None:
                 raise RuntimeError("tgz 包内未找到 PDF 文件")
@@ -561,41 +595,31 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
             tgz_temp_path.unlink()
 
 
-def download_with_fallback(
-    links: dict[str, str],
-    pdf_path: Path,
-    txt_path: Path,
-    prefer_format: str = "pdf",
-) -> str | None:
+def download_oa_pdf(links: dict[str, str], pdf_path: Path) -> bool:
     """
-    按用户指定优先格式下载；优先格式失败或缺失时回退另一种。
-    返回 "pdf" / "txt" / None。
+    下载整篇正文 PDF，不做 txt 回退。
+    优先 pdf 直链；无直链或直链失败时从 tgz 包内提取正文 PDF。
+    返回是否成功。
     """
     pdf_url = links.get("pdf")
     tgz_url = links.get("tgz")
 
-    ordered_formats = ["pdf", "txt"] if prefer_format != "txt" else ["txt", "pdf"]
+    if pdf_url and download_pdf_file(pdf_url, pdf_path):
+        return True
 
-    for fmt in ordered_formats:
-        if fmt == "pdf":
-            if pdf_url and download_pdf_file(pdf_url, pdf_path):
-                return "pdf"
-            if (not pdf_url) and tgz_url and download_pdf_from_tgz(tgz_url, pdf_path):
-                return "pdf"
-        else:
-            if tgz_url and download_txt_from_tgz(tgz_url, txt_path):
-                return "txt"
+    if tgz_url and download_pdf_from_tgz(tgz_url, pdf_path):
+        return True
 
-    return None
+    return False
 
 # ── 业务流程 ──────────────────────────────────────────────────
 
-def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
+def run_pdf_download(db_path: Path = DB_PATH):
     """
     执行 PDF 下载主流程。
     """
     logger.info("=" * 60)
-    logger.info("阶段四：下载 OA 全文（PDF/TXT）")
+    logger.info("阶段四：下载 OA 全文（仅 PDF）")
     logger.info("=" * 60)
 
     # 1. 查找高/中相关且有 PMC ID 的文献
@@ -613,11 +637,6 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
     if not records:
         logger.info("未发现符合下载条件（有 PMC ID 且 LLM 判定相关）的文献。")
         return
-
-    prefer_format = prefer_format.lower().strip()
-    if prefer_format not in {"pdf", "txt"}:
-        prefer_format = "pdf"
-    logger.info(f"下载优先格式: {prefer_format.upper()}")
 
     logger.info(f"符合条件的文献共 {len(records)} 篇，开始获取下载链接...")
 
@@ -652,7 +671,6 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
 
     # 3. 执行下载
     pdf_success_count = 0
-    txt_success_count = 0
     failed_count = 0
     skip_count = 0
     failed_items: list[dict] = []
@@ -664,9 +682,8 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
             info = pmc_to_info[pmc_id]
             dest_dir = PDF_DIR
             pdf_path = dest_dir / f"{info['pmid']}.pdf"
-            txt_path = dest_dir / f"{info['pmid']}.txt"
 
-            if pdf_path.exists() or txt_path.exists():
+            if pdf_path.exists():
                 skip_count += 1
                 continue
 
@@ -674,36 +691,29 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
                 "pmc_id": pmc_id,
                 "links": links,
                 "pdf_path": pdf_path,
-                "txt_path": txt_path,
-                "prefer_format": prefer_format,
                 "pmid": info["pmid"],
                 }
             future = executor.submit(
-                download_with_fallback,
+                download_oa_pdf,
                 links,
                 pdf_path,
-                txt_path,
-                prefer_format,
             )
             future_to_meta[future] = meta
 
         for future in as_completed(future_to_meta):
-            result = future.result()
+            ok = future.result()
             meta = future_to_meta[future]
-            if result == "pdf":
+            if ok:
                 pdf_success_count += 1
-            elif result == "txt":
-                txt_success_count += 1
             else:
                 failed_count += 1
                 failed_items.append(meta)
 
-            total_success = pdf_success_count + txt_success_count
-            if total_success % 10 == 0 and total_success > 0:
-                logger.info(f"  已下载 {total_success} 篇（PDF: {pdf_success_count}, TXT: {txt_success_count}）...")
+            if pdf_success_count > 0 and pdf_success_count % 10 == 0:
+                logger.info(f"  已下载 {pdf_success_count} 篇 PDF...")
 
     logger.info(
-        f"首次下载完成：PDF {pdf_success_count} 篇，TXT {txt_success_count} 篇，"
+        f"首次下载完成：PDF {pdf_success_count} 篇，"
         f"失败 {failed_count} 篇，跳过 {skip_count} 篇。"
     )
 
@@ -713,7 +723,6 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
     while failed_items and retry_round < MAX_RETRIES:
         retry_round += 1
         retry_success_pdf = 0
-        retry_success_txt = 0
         retry_fail: list[dict] = []
 
         logger.info(
@@ -723,35 +732,115 @@ def run_pdf_download(db_path: Path = DB_PATH, prefer_format: str = "pdf"):
         with ThreadPoolExecutor(max_workers=DOWNLOAD_MAX_WORKERS) as executor:
             retry_future_to_meta = {
                 executor.submit(
-                    download_with_fallback,
+                    download_oa_pdf,
                     item["links"],
                     item["pdf_path"],
-                    item["txt_path"],
-                    item["prefer_format"],
                 ): item
                 for item in failed_items
             }
 
             for future in as_completed(retry_future_to_meta):
-                result = future.result()
-                if result == "pdf":
+                ok = future.result()
+                if ok:
                     retry_success_pdf += 1
-                elif result == "txt":
-                    retry_success_txt += 1
                 else:
                     retry_fail.append(retry_future_to_meta[future])
 
         failed_items = retry_fail
         logger.info(
             f"重试第 {retry_round} 轮完成：PDF {retry_success_pdf} 篇，"
-            f"TXT {retry_success_txt} 篇，仍失败 {len(failed_items)} 篇。"
+            f"仍失败 {len(failed_items)} 篇。"
         )
 
     # 5. 导出最终失败链接列表
     if failed_items:
         failed_csv = export_failed_links_csv(failed_items, out_dir=OUTPUT_DIR)
-        logger.info(f"仍有 {len(failed_items)} 篇下载失败，失败链接清单: {failed_csv}")
-    else:
+        checkpoint_items = [
+            {"pmid": item["pmid"], "pmc_id": item["pmc_id"], "links": item["links"]}
+            for item in failed_items
+        ]
+        _save_pdf_checkpoint(checkpoint_items)
+        logger.info(f"仍有 {len(failed_items)} 篇下载失败，失败链接清单: {failed_csv}，运行 --step pdf-retry 可续跑。")
+    elif pdf_success_count + failed_count + skip_count > 0:
+        _clear_pdf_checkpoint()
         logger.info("所有下载任务均已成功完成。")
+    else:
+        logger.info("本次无下载任务执行，保留既有检查点。")
 
     logger.info(f"存储位置: {PDF_DIR}")
+
+
+# ── 失败重试（断点续传） ─────────────────────────────────────
+
+def run_pdf_retry(db_path: Path = DB_PATH):
+    """
+    仅重试之前失败的 PDF 下载，支持断点续传。
+    优先恢复 checkpoint；无 checkpoint 时读取最新失败清单 CSV。
+    """
+    logger.info("=" * 60)
+    logger.info("阶段四补：重试失败的 OA 全文下载")
+    logger.info("=" * 60)
+
+    pending = _load_pdf_checkpoint()
+    if pending:
+        logger.info(f"从检查点恢复 {len(pending)} 篇待重试项。")
+    else:
+        pending = load_failed_items_from_csv()
+        if not pending:
+            logger.info("无检查点且无失败清单，没有可重试项。")
+            return
+
+    pending = [
+        item for item in pending
+        if not (item.get("pmid") and (PDF_DIR / f"{item['pmid']}.pdf").exists())
+    ]
+    logger.info(f"过滤已下载后待重试 {len(pending)} 篇。")
+
+    if not pending:
+        _clear_pdf_checkpoint()
+        logger.info("所有待重试项均已存在，无需下载。")
+        return
+
+    # 混合取链：已有链接的直接用；链接缺失的重新查 OA API
+    missing = [item for item in pending if not item.get("links")]
+    if missing:
+        missing_pmcs = [item["pmc_id"] for item in missing if item.get("pmc_id")]
+        if missing_pmcs:
+            logger.info(f"需重新查询 OA 链接 {len(missing_pmcs)} 篇...")
+            oa_links = fetch_oa_links(missing_pmcs)
+            for item in pending:
+                if not item.get("links"):
+                    item["links"] = oa_links.get(item.get("pmc_id"), {})
+
+    success_count = 0
+    failed_items: list[dict] = []
+    remaining = list(pending)
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_MAX_WORKERS) as executor:
+        future_to_item: dict = {}
+        for item in pending:
+            pmid = item["pmid"]
+            pdf_path = PDF_DIR / f"{pmid}.pdf"
+            future = executor.submit(download_oa_pdf, item.get("links") or {}, pdf_path)
+            future_to_item[future] = item
+
+        for future in as_completed(future_to_item):
+            item = future_to_item[future]
+            if future.result():
+                success_count += 1
+                remaining.remove(item)
+            else:
+                failed_items.append(item)
+
+            if success_count > 0 and success_count % RETRY_CHECKPOINT_INTERVAL == 0:
+                _save_pdf_checkpoint(remaining)
+
+    logger.info(f"重试完成：成功 {success_count} 篇，失败 {len(failed_items)} 篇。")
+
+    if failed_items:
+        _save_pdf_checkpoint(failed_items)
+        export_failed_links_csv(failed_items)
+        logger.info(f"仍有 {len(failed_items)} 篇失败，检查点已保留，可再次运行 --step pdf-retry。")
+    else:
+        _clear_pdf_checkpoint()
+        logger.info("全部重试成功。")

@@ -12,11 +12,11 @@ from downloader.pdf_downloader import (
     fetch_oa_links,
     load_cached_oa_links,
     download_pdf_file,
-    download_txt_from_tgz,
     download_pdf_from_tgz,
-    download_with_fallback,
+    download_oa_pdf,
     export_oa_links_csv,
 )
+from utils.db import CREATE_ARTICLES_SQL, CREATE_LLM_VALIDATION_SQL
 
 
 class TestPdfDownloaderUrlNormalize(unittest.TestCase):
@@ -48,20 +48,22 @@ class TestFetchOaLinks(unittest.TestCase):
     def test_should_fetch_batch_and_parse_pdf_tgz(self, mock_get, _mock_sleep):
         def build_resp(xml_text: str):
             resp = Mock()
+            resp.status_code = 200
             resp.content = xml_text.encode("utf-8")
             resp.raise_for_status = Mock()
             return resp
 
-        def fake_get(_url, params=None, timeout=45):
-            self.assertEqual(timeout, 45)
-            self.assertIn(("id", "PMC4334330"), params)
-            self.assertIn(("id", "PMCXXXX"), params)
+        def fake_get(_url, params=None, timeout=30):
+            self.assertEqual(timeout, 30)
+            if params.get("id") == "PMC4334330":
+                return build_resp(
+                    "<OA><records><record id='PMC4334330'>"
+                    "<link format='pdf' href='ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/a/b/test.PMC4334330.pdf' />"
+                    "<link format='tgz' href='ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/a/b/PMC4334330.tar.gz' />"
+                    "</record></records></OA>"
+                )
             return build_resp(
-                "<OA><records><record id='PMC4334330'>"
-                "<link format='pdf' href='ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/a/b/test.PMC4334330.pdf' />"
-                "<link format='tgz' href='ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/a/b/PMC4334330.tar.gz' />"
-                "</record></records>"
-                "<error code='idDoesNotExist'>PMCXXXX</error></OA>"
+                "<OA><error code='idDoesNotExist'>PMCXXXX</error></OA>"
             )
 
         mock_get.side_effect = fake_get
@@ -84,12 +86,13 @@ class TestFetchOaLinks(unittest.TestCase):
     def test_should_retry_single_query_for_unresolved_ids(self, mock_get, _mock_sleep):
         def build_resp(xml_text: str):
             resp = Mock()
+            resp.status_code = 200
             resp.content = xml_text.encode("utf-8")
             resp.raise_for_status = Mock()
             return resp
 
-        def fake_get(_url, params=None, timeout=45):
-            if isinstance(params, list):
+        def fake_get(_url, params=None, timeout=30):
+            if params == {"id": "PMC1"}:
                 return build_resp(
                     "<OA><records><record id='PMC1'>"
                     "<link format='pdf' href='ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/a/b/1.pdf' />"
@@ -180,17 +183,22 @@ class TestDownloadPdfFromTgz(unittest.TestCase):
             self.assertGreater(dest.stat().st_size, 1024)
 
 
-class TestDownloadTxtFromTgz(unittest.TestCase):
+class TestDownloadPdfFromTgzPicksArticlePdf(unittest.TestCase):
     @patch("downloader.pdf_downloader.subprocess.run")
-    def test_should_extract_text_from_xml_when_no_txt_member(self, mock_run):
-        paragraph = " ".join(["Potato disease resistance is important for breeding and genomic analysis."] * 8)
-        xml = f"<article><body><p>{paragraph}</p></body></article>"
+    def test_should_pick_article_pdf_when_supplementary_pdf_comes_first(self, mock_run):
+        article_pdf_payload = b"%PDF-1.4\n" + (b"ARTICLE-CONTENT-ABCD" * 300)
+        supp_pdf_payload = b"%PDF-1.4\n" + (b"SUPPLEMENT-FIGURES-TABLES-YZ" * 300)
         buf = io.BytesIO()
+
+        def add_member(tar, name, data):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-            content = xml.encode("utf-8")
-            info = tarfile.TarInfo(name="article.nxml")
-            info.size = len(content)
-            tar.addfile(info, io.BytesIO(content))
+            add_member(tar, "PMC4334330/jmdh-8-091-s001.pdf", supp_pdf_payload)
+            add_member(tar, "PMC4334330/jmdh-8-091.PMC4334330.pdf", article_pdf_payload)
+            add_member(tar, "PMC4334330/jmdh-8-091.PMC4334330.nxml", b"<article/>")
 
         tgz_bytes = buf.getvalue()
 
@@ -204,54 +212,82 @@ class TestDownloadTxtFromTgz(unittest.TestCase):
         mock_run.side_effect = fake_run
 
         with tempfile.TemporaryDirectory() as td:
-            dest = Path(td) / "out.txt"
-            ok = download_txt_from_tgz("https://example.org/a.tgz", dest)
+            dest = Path(td) / "out.pdf"
+            ok = download_pdf_from_tgz("https://example.org/a.tgz", dest)
 
             self.assertTrue(ok)
-            self.assertTrue(dest.exists())
-            self.assertIn("Potato disease resistance", dest.read_text(encoding="utf-8"))
+            content = dest.read_bytes()
+            self.assertIn(b"ARTICLE-CONTENT", content)
+            self.assertNotIn(b"F002;SUPPLEMENT", content)
 
 
-class TestDownloadWithFallback(unittest.TestCase):
+class TestDownloadOaPdf(unittest.TestCase):
     @patch("downloader.pdf_downloader.download_pdf_from_tgz")
-    @patch("downloader.pdf_downloader.download_txt_from_tgz")
     @patch("downloader.pdf_downloader.download_pdf_file")
-    def test_should_try_txt_first_when_prefer_txt(self, mock_pdf, mock_txt, mock_pdf_from_tgz):
+    def test_should_download_pdf_direct_when_pdf_link_present(self, mock_pdf, mock_pdf_from_tgz):
         mock_pdf.return_value = True
-        mock_txt.return_value = True
         mock_pdf_from_tgz.return_value = True
 
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            result = download_with_fallback(
+            ok = download_oa_pdf(
                 links={"pdf": "https://example.org/a.pdf", "tgz": "https://example.org/a.tgz"},
                 pdf_path=base / "a.pdf",
-                txt_path=base / "a.txt",
-                prefer_format="txt",
             )
 
-        self.assertEqual(result, "txt")
-        mock_txt.assert_called_once()
-        mock_pdf.assert_not_called()
+        self.assertTrue(ok)
+        mock_pdf.assert_called_once()
         mock_pdf_from_tgz.assert_not_called()
 
     @patch("downloader.pdf_downloader.download_pdf_from_tgz")
     @patch("downloader.pdf_downloader.download_pdf_file")
-    def test_should_fallback_to_extract_pdf_from_tgz_when_pdf_link_missing(self, mock_pdf, mock_pdf_from_tgz):
+    def test_should_extract_pdf_from_tgz_when_pdf_link_missing(self, mock_pdf, mock_pdf_from_tgz):
         mock_pdf.return_value = False
         mock_pdf_from_tgz.return_value = True
 
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
-            result = download_with_fallback(
+            ok = download_oa_pdf(
                 links={"tgz": "https://example.org/a.tgz"},
                 pdf_path=base / "a.pdf",
-                txt_path=base / "a.txt",
-                prefer_format="pdf",
             )
 
-        self.assertEqual(result, "pdf")
+        self.assertTrue(ok)
         mock_pdf.assert_not_called()
+        mock_pdf_from_tgz.assert_called_once()
+
+    @patch("downloader.pdf_downloader.download_pdf_from_tgz")
+    @patch("downloader.pdf_downloader.download_pdf_file")
+    def test_should_extract_from_tgz_when_pdf_direct_download_fails(self, mock_pdf, mock_pdf_from_tgz):
+        mock_pdf.return_value = False
+        mock_pdf_from_tgz.return_value = True
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            ok = download_oa_pdf(
+                links={"pdf": "https://example.org/a.pdf", "tgz": "https://example.org/a.tgz"},
+                pdf_path=base / "a.pdf",
+            )
+
+        self.assertTrue(ok)
+        mock_pdf.assert_called_once()
+        mock_pdf_from_tgz.assert_called_once()
+
+    @patch("downloader.pdf_downloader.download_pdf_from_tgz")
+    @patch("downloader.pdf_downloader.download_pdf_file")
+    def test_should_fail_when_pdf_unavailable(self, mock_pdf, mock_pdf_from_tgz):
+        mock_pdf.return_value = False
+        mock_pdf_from_tgz.return_value = False
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            ok = download_oa_pdf(
+                links={"pdf": "https://example.org/a.pdf", "tgz": "https://example.org/a.tgz"},
+                pdf_path=base / "a.pdf",
+            )
+
+        self.assertFalse(ok)
+        mock_pdf.assert_called_once()
         mock_pdf_from_tgz.assert_called_once()
 
 
@@ -312,6 +348,312 @@ class TestExportOaLinksCsv(unittest.TestCase):
         
         self.assertEqual(rows[0]["pdf_url"], "https://example.org/1.pdf")
         self.assertEqual(rows[1]["tgz_url"], "https://example.org/2.tgz")
+
+
+class TestPdfCheckpoint(unittest.TestCase):
+    def test_should_save_and_load_pending(self):
+        from downloader.pdf_downloader import (
+            _save_pdf_checkpoint, _load_pdf_checkpoint, _clear_pdf_checkpoint,
+        )
+
+        pending = [
+            {"pmid": "111", "pmc_id": "PMC1", "links": {"pdf": "https://a/1.pdf"}},
+            {"pmid": "112", "pmc_id": "PMC2", "links": {}},
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch("downloader.pdf_downloader.OUTPUT_DIR", Path(td)):
+                _save_pdf_checkpoint(pending)
+                self.assertEqual(_load_pdf_checkpoint(), pending)
+                _clear_pdf_checkpoint()
+                self.assertEqual(_load_pdf_checkpoint(), [])
+
+    def test_should_return_empty_when_checkpoint_missing(self):
+        from downloader.pdf_downloader import _load_pdf_checkpoint
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch("downloader.pdf_downloader.OUTPUT_DIR", Path(td)):
+                self.assertEqual(_load_pdf_checkpoint(), [])
+
+    def test_should_return_empty_when_checkpoint_corrupted(self):
+        from downloader.pdf_downloader import (
+            _pdf_checkpoint_path, _load_pdf_checkpoint,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch("downloader.pdf_downloader.OUTPUT_DIR", Path(td)):
+                path = _pdf_checkpoint_path()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{not valid json", encoding="utf-8")
+                self.assertEqual(_load_pdf_checkpoint(), [])
+
+
+class TestLoadFailedItemsFromCsv(unittest.TestCase):
+    def test_should_parse_latest_failed_csv(self):
+        from downloader.pdf_downloader import load_failed_items_from_csv
+
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            old = out_dir / "failed_downloads_20260101_010101.csv"
+            new = out_dir / "failed_downloads_20260102_010101.csv"
+            old.write_text(
+                'pmid,pmc_id,pdf_url,tgz_url\n111,PMC1,https://old/1.pdf,\n',
+                encoding="utf-8-sig",
+            )
+            new.write_text(
+                'pmid,pmc_id,pdf_url,tgz_url\n'
+                '222,PMC2,,\n'
+                '333,pmc3,ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/a/b/3.PMC3.pdf,\n',
+                encoding="utf-8-sig",
+            )
+
+            items = load_failed_items_from_csv(out_dir=out_dir)
+
+        self.assertEqual(
+            items,
+            [
+                {"pmid": "222", "pmc_id": "PMC2", "links": {}},
+                {
+                    "pmid": "333",
+                    "pmc_id": "PMC3",
+                    "links": {
+                        "pdf": "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_pdf/a/b/3.PMC3.pdf",
+                    },
+                },
+            ],
+        )
+
+    def test_should_parse_tgz_url(self):
+        from downloader.pdf_downloader import load_failed_items_from_csv
+
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            (out_dir / "failed_downloads_20260101_010101.csv").write_text(
+                "pmid,pmc_id,pdf_url,tgz_url\n"
+                "444,PMC4,,ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/a/b/4.PMC4.tar.gz\n",
+                encoding="utf-8-sig",
+            )
+
+            items = load_failed_items_from_csv(out_dir=out_dir)
+
+        self.assertEqual(
+            items,
+            [
+                {
+                    "pmid": "444",
+                    "pmc_id": "PMC4",
+                    "links": {
+                        "tgz": "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_package/a/b/4.PMC4.tar.gz",
+                    },
+                },
+            ],
+        )
+
+    def test_should_return_empty_when_no_csv(self):
+        from downloader.pdf_downloader import load_failed_items_from_csv
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(load_failed_items_from_csv(out_dir=Path(td)), [])
+
+    def test_should_return_empty_when_csv_corrupted(self):
+        from downloader.pdf_downloader import load_failed_items_from_csv
+
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            (out_dir / "failed_downloads_20260101_010101.csv").write_bytes(
+                b"pmid,pmc_id,pdf_url,tgz_url\n\xc3\x28",
+            )
+            self.assertEqual(load_failed_items_from_csv(out_dir=out_dir), [])
+
+
+class TestRunPdfRetry(unittest.TestCase):
+    @patch("downloader.pdf_downloader._load_pdf_checkpoint")
+    @patch("downloader.pdf_downloader.load_failed_items_from_csv")
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.export_failed_links_csv")
+    @patch("downloader.pdf_downloader._clear_pdf_checkpoint")
+    def test_should_resume_from_checkpoint_and_clear_on_success(
+        self, mock_clear, mock_export_csv, mock_dl, mock_fetch,
+        mock_csv, mock_checkpoint,
+    ):
+        mock_dl.return_value = True
+        mock_fetch.return_value = {}
+        with tempfile.TemporaryDirectory() as td:
+            pdf_dir = Path(td)
+            (pdf_dir / "222.pdf").write_bytes(b"%PDF-1.4\n" + b"A" * 2000)
+            mock_checkpoint.return_value = [
+                {"pmid": "111", "pmc_id": "PMC1", "links": {}},
+                {"pmid": "222", "pmc_id": "PMC2", "links": {"pdf": "https://a/2.pdf"}},
+            ]
+            with patch("downloader.pdf_downloader.PDF_DIR", pdf_dir):
+                from downloader.pdf_downloader import run_pdf_retry
+                run_pdf_retry()
+
+        mock_csv.assert_not_called()          # 有 checkpoint 不读 CSV
+        mock_fetch.assert_called_once()       # 仅 PMC1 无链接需重查
+        mock_dl.assert_called_once()          # 222.pdf 已存在被过滤，仅 111 需下载
+        mock_clear.assert_called_once()       # 全部处理后清除
+
+    @patch("downloader.pdf_downloader._load_pdf_checkpoint")
+    @patch("downloader.pdf_downloader.load_failed_items_from_csv")
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.export_failed_links_csv")
+    @patch("downloader.pdf_downloader._save_pdf_checkpoint")
+    @patch("downloader.pdf_downloader._clear_pdf_checkpoint")
+    def test_should_keep_checkpoint_when_partial_failure(
+        self, mock_clear, mock_save, mock_export, mock_dl, mock_fetch, mock_csv, mock_checkpoint,
+    ):
+        mock_checkpoint.return_value = []
+        mock_csv.return_value = [
+            {"pmid": "333", "pmc_id": "PMC3", "links": {"pdf": "https://a/3.pdf"}},
+            {"pmid": "444", "pmc_id": "PMC4", "links": {"pdf": "https://a/4.pdf"}},
+        ]
+        mock_fetch.return_value = {}
+        mock_dl.return_value = False
+        mock_export.return_value = Path("failed_downloads_x.csv")
+        with tempfile.TemporaryDirectory() as td:
+            with patch("downloader.pdf_downloader.PDF_DIR", Path(td)):
+                from downloader.pdf_downloader import run_pdf_retry
+                run_pdf_retry()
+
+        mock_save.assert_called()
+        mock_clear.assert_not_called()
+        mock_export.assert_called_once()
+
+    @patch("downloader.pdf_downloader._load_pdf_checkpoint")
+    @patch("downloader.pdf_downloader.load_failed_items_from_csv")
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.export_failed_links_csv")
+    @patch("downloader.pdf_downloader._save_pdf_checkpoint")
+    @patch("downloader.pdf_downloader._clear_pdf_checkpoint")
+    def test_should_snapshot_only_unfinished_items(
+        self, mock_clear, mock_save, mock_export, mock_dl, mock_fetch, mock_csv, mock_checkpoint,
+    ):
+        mock_checkpoint.return_value = []
+        mock_csv.return_value = [
+            {"pmid": str(i), "pmc_id": f"PMC{i}", "links": {"pdf": f"https://a/{i}.pdf"}}
+            for i in range(1, 16)
+        ]
+        mock_fetch.return_value = {}
+        mock_dl.side_effect = lambda links, pdf_path: Path(pdf_path).name in {
+            f"{i}.pdf" for i in range(1, 11)
+        }
+        mock_export.return_value = Path("failed_downloads_x.csv")
+        with tempfile.TemporaryDirectory() as td:
+            with patch("downloader.pdf_downloader.PDF_DIR", Path(td)):
+                from downloader.pdf_downloader import run_pdf_retry
+                run_pdf_retry()
+
+        saved_snapshots = [call.args[0] for call in mock_save.call_args_list]
+        self.assertTrue(saved_snapshots)
+        for snapshot in saved_snapshots:
+            snapshot_pmids = {item["pmid"] for item in snapshot}
+            self.assertFalse(snapshot_pmids & {str(i) for i in range(1, 11)})
+            self.assertTrue(snapshot_pmids)
+        self.assertEqual(
+            {item["pmid"] for item in saved_snapshots[-1]},
+            {str(i) for i in range(11, 16)},
+        )
+
+
+class TestRunPdfWriteCheckpoint(unittest.TestCase):
+    def _make_db_with_pmc(self, td: Path, pmid: str = "1111", pmc_id: str = "PMC1") -> Path:
+        import sqlite3
+        db = td / "test.db"
+        conn = sqlite3.connect(db)
+        conn.execute(CREATE_ARTICLES_SQL)
+        conn.execute(CREATE_LLM_VALIDATION_SQL)
+        conn.execute(
+            "INSERT INTO articles (pmid, pmc_id) VALUES (?, ?)", (pmid, pmc_id)
+        )
+        conn.execute(
+            "INSERT INTO llm_validation (pmid, llm_verdict) VALUES (?, 'RELEVANT')",
+            (pmid,),
+        )
+        conn.commit()
+        conn.close()
+        return db
+
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.load_cached_oa_links")
+    @patch("downloader.pdf_downloader.export_oa_links_csv")
+    def test_should_write_checkpoint_on_failure(
+        self, mock_export_csv, mock_cached, mock_dl, mock_fetch,
+    ):
+        mock_fetch.return_value = {"PMC1": {"pdf": "https://a/1.pdf"}}
+        mock_dl.return_value = False
+        mock_export_csv.return_value = Path("links.csv")
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            db = self._make_db_with_pmc(td_path)
+            with patch("downloader.pdf_downloader.PDF_DIR", td_path):
+                with patch("downloader.pdf_downloader.OUTPUT_DIR", td_path):
+                    from downloader.pdf_downloader import (
+                        run_pdf_download, _load_pdf_checkpoint, _pdf_checkpoint_path,
+                    )
+                    run_pdf_download(db_path=db)
+
+                    checkpoint_items = _load_pdf_checkpoint()
+                    checkpoint_path = _pdf_checkpoint_path()
+
+                    self.assertTrue(checkpoint_path.exists())
+                    self.assertEqual(len(checkpoint_items), 1)
+                    self.assertEqual(checkpoint_items[0]["pmid"], "1111")
+                    self.assertEqual(checkpoint_items[0]["pmc_id"], "PMC1")
+                    self.assertEqual(checkpoint_items[0]["links"], {"pdf": "https://a/1.pdf"})
+                    self.assertNotIn("pdf_path", checkpoint_items[0])
+
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.load_cached_oa_links")
+    @patch("downloader.pdf_downloader.export_oa_links_csv")
+    def test_should_clear_checkpoint_on_success(
+        self, mock_export_csv, mock_cached, mock_dl, mock_fetch,
+    ):
+        mock_fetch.return_value = {"PMC1": {"pdf": "https://a/1.pdf"}}
+        mock_dl.return_value = True
+        mock_export_csv.return_value = Path("links.csv")
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            db = self._make_db_with_pmc(td_path)
+            with patch("downloader.pdf_downloader.PDF_DIR", td_path):
+                with patch("downloader.pdf_downloader.OUTPUT_DIR", td_path):
+                    from downloader.pdf_downloader import (
+                        run_pdf_download, _save_pdf_checkpoint, _pdf_checkpoint_path,
+                    )
+                    _save_pdf_checkpoint([{"pmid": "9999", "pmc_id": "PMC9", "links": {}}])
+                    run_pdf_download(db_path=db)
+
+                    checkpoint_exists = _pdf_checkpoint_path().exists()
+
+        self.assertFalse(checkpoint_exists)
+
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.load_cached_oa_links")
+    @patch("downloader.pdf_downloader.export_oa_links_csv")
+    def test_should_keep_checkpoint_when_no_task(
+        self, mock_export_csv, mock_cached, mock_fetch,
+    ):
+        mock_fetch.return_value = {}
+        mock_export_csv.return_value = Path("links.csv")
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            db = self._make_db_with_pmc(td_path)
+            with patch("downloader.pdf_downloader.PDF_DIR", td_path):
+                with patch("downloader.pdf_downloader.OUTPUT_DIR", td_path):
+                    from downloader.pdf_downloader import (
+                        run_pdf_download, _save_pdf_checkpoint, _pdf_checkpoint_path,
+                    )
+                    _save_pdf_checkpoint([{"pmid": "9999", "pmc_id": "PMC9", "links": {}}])
+                    run_pdf_download(db_path=db)
+
+                    checkpoint_exists = _pdf_checkpoint_path().exists()
+
+        self.assertTrue(checkpoint_exists)
 
 
 if __name__ == "__main__":

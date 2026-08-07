@@ -46,9 +46,14 @@ def step_clean():
     run_hard_filter(db_path=DB_PATH)
 
 
-def step_pdf(prefer_format: str = "pdf"):
+def step_pdf():
     from downloader.pdf_downloader import run_pdf_download
-    run_pdf_download(db_path=DB_PATH, prefer_format=prefer_format)
+    run_pdf_download(db_path=DB_PATH)
+
+
+def step_pdf_retry():
+    from downloader.pdf_downloader import run_pdf_retry
+    run_pdf_retry(db_path=DB_PATH)
 
 
 def step_validate(batch=False):
@@ -67,7 +72,7 @@ def main():
     )
     parser.add_argument(
         "--step",
-        choices=["download", "parse", "clean", "pdf", "validate", "import-review", "all"],
+        choices=["download", "parse", "clean", "pdf", "pdf-retry", "validate", "import-review", "all"],
         default="all",
         help="运行指定阶段（默认 all）",
     )
@@ -80,12 +85,6 @@ def main():
         "--xml-dir",
         default=None,
         help="XML 文件目录（仅在 parse / all 阶段生效）",
-    )
-    parser.add_argument(
-        "--prefer-format",
-        choices=["pdf", "txt"],
-        default="pdf",
-        help="pdf 阶段优先下载格式（默认 pdf，失败时自动回退）",
     )
     parser.add_argument(
         "--csv",
@@ -120,7 +119,10 @@ def main():
         step_clean()
 
     if step == "pdf":
-        step_pdf(args.prefer_format)
+        step_pdf()
+
+    if step == "pdf-retry":
+        step_pdf_retry()
 
     if step == "validate":
         step_validate(args.batch)
