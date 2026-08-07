@@ -8,7 +8,7 @@
 
 - **并发下载** — XML 批次下载自动并发（`ThreadPoolExecutor` + 全局速率限制器），充分发挥 NCBI API 配额
 - **二级过滤** — 硬过滤（规则引擎）→ LLM 验证（多 Provider）
-- **断点续传** — XML 批次自动跳过已下载文件；LLM 验证崩溃后可恢复
+- **断点续传** — XML 批次自动跳过已下载文件；LLM 验证崩溃后可恢复；PDF 下载失败可 `--step pdf-retry` 续跑
 - **多 Provider** — 支持 DeepSeek、智谱 GLM、OpenAI 兼容 API 三种 LLM 后端
 - **智谱 Batch API** — 异步批量验证，支持中断恢复与自动降级同步模式重试
 - **数据库复用连接** — 所有批处理操作复用单连接，减少连接开销
@@ -21,7 +21,7 @@ PubMed E-utilities 下载的是 **XML 格式的元数据**（标题、摘要、�
 - XML 结构化程度高，解析准确
 - 不存在版权问题，可自由下载
 
-如需全文，PMC 开放获取文章可通过 `--step pdf` 参数额外下载 PDF/TXT。
+如需全文，PMC 开放获取文章可通过 `--step pdf` 参数额外下载 PDF，失败后可 `--step pdf-retry` 续传。
 
 ## 项目结构
 
@@ -34,7 +34,7 @@ Potato-Literature-Search/
 ├── downloader/
 │   ├── __init__.py
 │   ├── pubmed_downloader.py     # NCBI E-utilities 批量下载 XML（并发 + 速率限制）
-│   └── pdf_downloader.py        # PMC OA 全文下载（PDF/TGZ），含重试机制
+│   └── pdf_downloader.py        # PMC OA 全文下载（PDF/TGZ），失败导出清单 + checkpoint 断点续传
 ├── parser/
 │   ├── __init__.py
 │   └── xml_parser.py            # XML 解析 → SQLite（复用单连接写入）
@@ -50,7 +50,7 @@ Potato-Literature-Search/
 │   ├── raw_xml/                 # 原始 XML 文件
 │   ├── processed/               # SQLite 数据库（potato_lit.db）
 │   ├── output/                  # CSV 输出
-│   └── pdfs/                    # LLM 判定相关文献的 PDF/TXT 全文
+│   └── pdfs/                    # LLM 判定相关文献的 PDF 全文
 ├── logs/                        # 运行日志
 ├── tests/                       # 单元测试
 ├── main.py                      # 一键运行入口
@@ -118,9 +118,9 @@ python main.py --step import-review
 # 批量验证（智谱专用，异步处理大文献集）
 python main.py --step validate --batch
 
-# 6. 下载 OA 全文 PDF/TXT
-python main.py --step pdf                     # 默认 pdf 格式
-python main.py --step pdf --prefer-format txt   # 优先下载纯文本
+# 6. 下载 OA 全文 PDF
+python main.py --step pdf                     # 仅下载 OA 全文 PDF
+python main.py --step pdf-retry               # 仅重试之前失败的下载（断点续传）
 ```
 
 ### 单步运行
@@ -136,9 +136,11 @@ python main.py --step parse --xml-dir data/raw_xml
 # 仅硬过滤
 python main.py --step clean
 
-# 下载 OA 全文 PDF/TXT
+# 下载 OA 全文 PDF
 python main.py --step pdf
-python main.py --step pdf --prefer-format txt
+
+# 仅重试之前失败的 OA PDF 下载（断点续传，可中断后重复执行）
+python main.py --step pdf-retry
 
 # LLM 二次验证（同步模式 5 篇/批）
 python main.py --step validate
@@ -159,11 +161,10 @@ python main.py --query "potato AND drought AND gene"
 
 | 参数 | 适用阶段 | 说明 |
 |------|----------|------|
-| `--step` | 全部 | 运行指定阶段（download / parse / clean / pdf / validate / import-review / all） |
+| `--step` | 全部 | 运行指定阶段（download / parse / clean / pdf / pdf-retry / validate / import-review / all） |
 | `--batch` | validate | 使用智谱 Batch API 异步验证（仅 `LLM_PROVIDER=zhipu` 时生效，否则自动降级同步） |
 | `--query` | download / all | 自定义 PubMed 搜索词 |
 | `--xml-dir` | parse / all | XML 文件目录（默认 `data/raw_xml/`） |
-| `--prefer-format` | pdf | 优先下载格式（pdf / txt，默认 pdf） |
 | `--csv` | import-review | 人工复核 CSV 文件路径（默认自动查找最新文件） |
 
 ## 输出文件
@@ -174,7 +175,8 @@ python main.py --query "potato AND drought AND gene"
 | `data/output/llm_review_pending_*.csv` | LLM 验证待人工复核清单（标注 Y/N） |
 | `data/output/llm_validation_failed_*.csv` | LLM 校验失败 PMID 清单 |
 | `data/output/llm_filtered_*.csv` | LLM + 人工复核后的最终过滤结果 |
-| `data/output/failed_downloads_*.csv` | PDF 下载失败链接清单 |
+| `data/output/failed_downloads_*.csv` | PDF 下载失败链接清单（供 `--step pdf-retry` 续跑） |
+| `data/output/pdf_download_progress.json` | PDF 重试断点（中断后自动恢复） |
 | `data/output/oa_download_links_*.csv` | OA 资源下载链接清单 |
-| `data/pdfs/` | LLM 判定相关文献的 PDF/TXT 全文文件 |
+| `data/pdfs/` | LLM 判定相关文献的 PDF 全文文件 |
 | `logs/` | 各模块运行日志（按名称+日期分文件） |
