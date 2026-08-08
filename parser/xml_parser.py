@@ -133,17 +133,21 @@ def parse_article(article_el: etree._Element, source_file: str) -> dict | None:
         journal_abbr = jabbr_el.text.strip() if jabbr_el is not None else ""
 
         # ── DOI / PMC ────────────────────────────────────────
+        # 仅从 ArticleIdList 提取；不得用 .//ArticleId，
+        # 否则会穿透到 ReferenceList（参考文献）的 ArticleId，污染真实值。
         pd_el  = article_el.find("PubmedData")
         doi    = ""
         pmc_id = ""
         if pd_el is not None:
-            for aid in pd_el.findall(".//ArticleId"):
-                id_type = aid.get("IdType", "")
-                val     = (aid.text or "").strip()
-                if id_type == "doi":
-                    doi = val
-                elif id_type == "pmc":
-                    pmc_id = val
+            aid_list = pd_el.find("ArticleIdList")
+            if aid_list is not None:
+                for aid in aid_list.findall("ArticleId"):
+                    id_type = aid.get("IdType", "")
+                    val     = (aid.text or "").strip()
+                    if id_type == "doi":
+                        doi = val
+                    elif id_type == "pmc":
+                        pmc_id = val
 
         # ── 文章类型 ─────────────────────────────────────────
         article_types = _join([
