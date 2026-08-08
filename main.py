@@ -10,7 +10,8 @@
   python main.py --step clean      # 仅硬过滤
   python main.py --step pdf        # 下载 OA 全文（需先跑 LLM 验证）
   python main.py --step validate   # LLM 二次验证（需设置 LLM_API_KEY）
-  python main.py --step import-review  # 导入人工复核结果
+python main.py --step import-review  # 导入人工复核结果
+  python main.py --step export         # 导出复核通过文献的原始信息 CSV
   python main.py --query "potato AND drought"  # 自定义搜索词
 """
 
@@ -66,13 +67,20 @@ def step_import_review(csv_path: str = None):
     import_human_review(csv_path)
 
 
+def step_export():
+    from cleaner.llm_validator import _export_raw_csv
+    path = _export_raw_csv()
+    if path:
+        logger.info(f"原始文献信息已导出: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="马铃薯 PubMed 文献批量下载与清洗系统"
     )
     parser.add_argument(
         "--step",
-        choices=["download", "parse", "clean", "pdf", "pdf-retry", "validate", "import-review", "all"],
+        choices=["download", "parse", "clean", "pdf", "pdf-retry", "validate", "import-review", "export", "all"],
         default="all",
         help="运行指定阶段（默认 all）",
     )
@@ -129,6 +137,9 @@ def main():
 
     if step == "import-review":
         step_import_review(args.csv)
+
+    if step == "export":
+        step_export()
 
     logger.info("✔  全部流程完成")
     logger.info(f"   输出目录: {OUTPUT_DIR}")

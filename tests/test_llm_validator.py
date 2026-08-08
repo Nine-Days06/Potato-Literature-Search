@@ -1,5 +1,6 @@
 import unittest
 import json
+import csv
 import sqlite3
 import tempfile
 import os
@@ -12,7 +13,9 @@ from cleaner.llm_validator import (
     _build_log_rows,
     _count_verdicts,
     _normalize_verdict,
+    _export_raw_csv,
 )
+from utils.db import init_db, get_conn
 
 
 class TestExtractJsonMultiArray(unittest.TestCase):
@@ -379,6 +382,108 @@ class TestCountVerdicts(unittest.TestCase):
 
     def test_empty(self):
         self.assertEqual(_count_verdicts([]), {})
+
+
+class TestExportRawCsv(unittest.TestCase):
+    """_export_raw_csv：导出与 llm_filtered 相同筛选条件、仅含原始信息的 CSV"""
+
+    RAW_FIELDS = [
+        "pmid", "title", "abstract", "keywords", "mesh_terms",
+        "pub_year", "pub_month", "journal", "journal_abbr", "doi",
+        "pmc_id", "article_types", "authors", "affiliation",
+        "language",
+    ]
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "test.db"
+        init_db(self.db_path)
+        self._seed()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _seed(self):
+        articles = [
+            ("A", "Title A", "Abstract A", "2021", "Mar", "Plant J",
+             "PMC1", "batch1.xml"),
+            ("B", "Title B", "Abstract B", "2021", "Apr", "Potato Res",
+             "PMC2", "batch1.xml"),
+            ("C", "Title C", "Abstract C", "2021", "May", "Plant J",
+             "PMC3", "batch1.xml"),
+            ("D", "Title D", "Abstract D", "2021", "Jun", "Plant J",
+             "PMC4", "batch1.xml"),
+            ("E", "Title E", "Abstract E", "2021", "Jul", "Plant J",
+             "PMC5", "batch1.xml"),
+        ]
+        with get_conn(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO articles "
+                "(pmid, title, abstract, pub_year, pub_month, journal, "
+                "pmc_id, raw_xml_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                articles,
+            )
+            conn.executemany(
+                "INSERT INTO llm_validation (pmid, llm_verdict, human_review) "
+                "VALUES (?, ?, ?)",
+                [
+                    ("A", "RELEVANT", "Y"),        # 人工通过 → 应导出
+                    ("B", "RELEVANT", None),       # LLM 判相关未复核 → 应导出
+                    ("C", "RELEVANT", "N"),        # 人工驳回 → 不导出
+                    ("D", "NOT_RELEVANT", None),   # LLM 判不相关 → 不导出
+                ],
+            )
+            # E 无 llm_validation 记录 → 不导出
+
+    def _export(self):
+        import cleaner.llm_validator as mod
+        orig = mod.OUTPUT_DIR
+        mod.OUTPUT_DIR = self.temp_dir
+        try:
+            return mod._export_raw_csv(db_path=self.db_path)
+        finally:
+            mod.OUTPUT_DIR = orig
+
+    def test_export_includes_only_filtered_articles(self):
+        path = self._export()
+        self.assertIsNotNone(path)
+        with open(path, "r", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(sorted(r["pmid"] for r in rows), ["A", "B"])
+
+    def test_export_columns_are_raw_only(self):
+        path = self._export()
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            rows = list(reader)
+        self.assertEqual(fieldnames, self.RAW_FIELDS)
+        for col in ("llm_verdict", "llm_reason", "human_review", "raw_xml_file"):
+            self.assertNotIn(col, fieldnames)
+        self.assertEqual(len(rows), 2)
+
+    def test_export_preserves_raw_values(self):
+        path = self._export()
+        with open(path, "r", encoding="utf-8-sig") as f:
+            rows = {r["pmid"]: r for r in csv.DictReader(f)}
+        a = rows["A"]
+        self.assertEqual(a["title"], "Title A")
+        self.assertEqual(a["journal"], "Plant J")
+        self.assertEqual(a["pub_month"], "Mar")
+
+    def test_export_filename_and_bom(self):
+        path = self._export()
+        self.assertTrue(path.name.startswith("articles_raw_"))
+        self.assertTrue(path.name.endswith(".csv"))
+        with open(path, "rb") as f:
+            self.assertTrue(f.read(3).startswith(b"\xef\xbb\xbf"))
+
+    def test_export_empty_returns_none(self):
+        with get_conn(self.db_path) as conn:
+            conn.execute("DELETE FROM llm_validation")
+        path = self._export()
+        self.assertIsNone(path)
 
 
 if __name__ == "__main__":

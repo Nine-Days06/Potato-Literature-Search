@@ -115,6 +115,9 @@ python main.py --step validate
 # 5. 导入人工复核结果（在导出的 CSV 中标注 Y/N 后）
 python main.py --step import-review
 
+# 5.1 导出复核通过文献的原始信息（不含 LLM 判断与人工复核列）
+python main.py --step export
+
 # 批量验证（智谱专用，异步处理大文献集）
 python main.py --step validate --batch
 
@@ -153,6 +156,9 @@ python main.py --step import-review
 # 指定复核文件
 python main.py --step import-review --csv data/output/llm_review_pending_20250101_120000.csv
 
+# 导出复核通过文献的原始信息 CSV（pmid/title/abstract 等全部原始字段，无 LLM/复核列）
+python main.py --step export
+
 # 自定义搜索词
 python main.py --query "potato AND drought AND gene"
 ```
@@ -161,7 +167,7 @@ python main.py --query "potato AND drought AND gene"
 
 | 参数 | 适用阶段 | 说明 |
 |------|----------|------|
-| `--step` | 全部 | 运行指定阶段（download / parse / clean / pdf / pdf-retry / validate / import-review / all） |
+| `--step` | 全部 | 运行指定阶段（download / parse / clean / pdf / pdf-retry / validate / import-review / export / all） |
 | `--batch` | validate | 使用智谱 Batch API 异步验证（仅 `LLM_PROVIDER=zhipu` 时生效，否则自动降级同步） |
 | `--query` | download / all | 自定义 PubMed 搜索词 |
 | `--xml-dir` | parse / all | XML 文件目录（默认 `data/raw_xml/`） |
@@ -175,6 +181,7 @@ python main.py --query "potato AND drought AND gene"
 | `data/output/llm_review_pending_*.csv` | LLM 验证待人工复核清单（标注 Y/N） |
 | `data/output/llm_validation_failed_*.csv` | LLM 校验失败 PMID 清单 |
 | `data/output/llm_filtered_*.csv` | LLM + 人工复核后的最终过滤结果 |
+| `data/output/articles_raw_*.csv` | 复核通过文献的原始信息（不含 raw_xml_file、LLM/复核列） |
 | `data/output/failed_downloads_*.csv` | PDF 下载失败链接清单（供 `--step pdf-retry` 续跑） |
 | `data/output/pdf_download_progress.json` | PDF 重试断点（中断后自动恢复） |
 | `data/output/oa_download_links_*.csv` | OA 资源下载链接清单 |

@@ -1391,3 +1391,48 @@ def _export_filtered_csv() -> Path | None:
 
     logger.info(f"最终过滤结果: {csv_path} ({len(rows)} 篇)")
     return csv_path
+
+
+RAW_EXPORT_FIELDS = [
+    "pmid", "title", "abstract", "keywords", "mesh_terms",
+    "pub_year", "pub_month", "journal", "journal_abbr", "doi",
+    "pmc_id", "article_types", "authors", "affiliation",
+    "language",
+]
+
+
+def _export_raw_csv(db_path: Path = DB_PATH) -> Path | None:
+    """
+    导出复核通过文献的原始信息 CSV（articles 表原始字段，不含 raw_xml_file、LLM/复核列）。
+    筛选条件与 _export_filtered_csv 一致：
+    human_review='Y' 或（未复核且 llm_verdict='RELEVANT'）。
+    """
+    with get_conn(db_path) as conn:
+        rows = conn.execute("""
+            SELECT a.pmid, a.title, a.abstract, a.keywords, a.mesh_terms,
+                   a.pub_year, a.pub_month, a.journal, a.journal_abbr, a.doi,
+                   a.pmc_id, a.article_types, a.authors, a.affiliation,
+                   a.language
+            FROM articles a
+            JOIN llm_validation v ON a.pmid = v.pmid
+            WHERE v.human_review = 'Y'
+               OR (v.human_review IS NULL AND v.llm_verdict = 'RELEVANT')
+        """).fetchall()
+
+    if not rows:
+        logger.info("没有符合条件的原始文献记录")
+        return None
+
+    out_dir = Path(OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = out_dir / f"articles_raw_{ts}.csv"
+
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=RAW_EXPORT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(dict(row))
+
+    logger.info(f"原始文献信息已导出: {csv_path} ({len(rows)} 篇)")
+    return csv_path
