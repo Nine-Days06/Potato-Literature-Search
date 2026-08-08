@@ -24,6 +24,11 @@ PDF_DIR = DATA_DIR / "pdfs"
 
 DB_PATH     = PROC_DIR / "potato_lit.db"
 
+# ── 网络代理配置 ────────────────────────────────────────────
+# 可选：HTTP/HTTPS 代理，如 http://127.0.0.1:7890（走代理访问 NCBI 等外网）
+# 留空则直连
+PROXY = os.environ.get("PROXY", "") or None
+
 # ── NCBI API 配置 ────────────────────────────────────────────
 # 填入你的 API Key，可将速率从 3 次/秒 提升到 10 次/秒
 # 留空也可运行，但会更慢

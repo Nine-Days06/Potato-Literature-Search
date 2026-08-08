@@ -24,7 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import (
     DB_PATH, PMC_OA_API, PDF_DIR,
-    REQUEST_INTERVAL, OUTPUT_DIR
+    REQUEST_INTERVAL, OUTPUT_DIR, PROXY
 )
 from utils.db import get_conn
 from utils.logger import get_logger
@@ -92,9 +92,12 @@ def _request_oa_with_retry(
     url: str, params: dict | list, max_retries: int = 3, timeout: int = 45
 ) -> requests.Response | None:
     """带指数退避重试的 OA API GET 请求。429/5xx 可重试，其他 4xx 不重试。"""
+    kwargs: dict = {"params": params, "timeout": timeout}
+    if PROXY:
+        kwargs["proxies"] = {"http": PROXY, "https": PROXY}
     for attempt in range(1, max_retries + 1):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = requests.get(url, **kwargs)
             if r.status_code == 429:
                 wait = 2 ** attempt
                 logger.warning(f"OA API rate limited (429), waiting {wait}s (attempt {attempt}/{max_retries})")
@@ -127,27 +130,33 @@ def _request_oa_with_retry(
     return None
 
 
-def _fetch_single_oa_link(pmc_id: str) -> tuple[str, dict[str, str] | None]:
+def _fetch_single_oa_link(pmc_id: str) -> tuple[str, dict[str, str] | None, str]:
     """
     查询单个 PMCID 的 OA 资源链接。
-    返回 (pmc_id, {"pdf": ..., "tgz": ...} | None)
+    返回 (pmc_id, links | None, status)，status ∈ {"ok", "not_oa", "network_fail"}。
     """
     parser = etree.XMLParser(recover=True)
 
     r = _request_oa_with_retry(PMC_OA_API, params={"id": pmc_id}, timeout=30)
     if r is None:
-        logger.warning(f"  单条查询失败: {pmc_id}（API 请求失败）")
-        return pmc_id, None
+        logger.warning(f"  单条查询失败（网络）: {pmc_id}（API 请求失败）")
+        return pmc_id, None, "network_fail"
 
     try:
         root = etree.fromstring(r.content, parser=parser)
     except Exception as e:
         logger.warning(f"  单条查询 XML 解析失败: {pmc_id} -> {e}")
-        return pmc_id, None
+        return pmc_id, None, "network_fail"
+
+    error = root.find(".//error")
+    if error is not None and error.get("code") in ("idIsNotOpenAccess", "idDoesNotExist"):
+        return pmc_id, None, "not_oa"
 
     record = root.find(".//record")
+    if record is None and root.tag == "record":
+        record = root
     if record is None:
-        return pmc_id, None
+        return pmc_id, None, "network_fail"
 
     links: dict[str, str] = {}
     pdf_link_node = record.find(".//link[@format='pdf']")
@@ -159,9 +168,9 @@ def _fetch_single_oa_link(pmc_id: str) -> tuple[str, dict[str, str] | None]:
         links["tgz"] = normalize_pmc_asset_url(tgz_link_node.get("href"))
 
     if not links:
-        return pmc_id, None
+        return pmc_id, None, "network_fail"
 
-    return pmc_id, links
+    return pmc_id, links, "ok"
 
 
 def _extract_links_from_record(record) -> tuple[str | None, dict[str, str] | None]:
@@ -248,13 +257,14 @@ def load_cached_oa_links(
 def fetch_oa_links(
     pmc_ids: list[str],
     cached_links: dict[str, dict[str, str]] | None = None,
-) -> dict[str, dict[str, str]]:
+) -> tuple[dict[str, dict[str, str]], list[str]]:
     """
     获取 PMCID 对应的 OA 资源链接（pdf/tgz）。
     `oa.fcgi` 仅支持单 ID 查询，这里用并发 + 速率控制逐条查询。
+    返回 (链接字典, 网络失败 PMCID 列表)；非 OA 的 PMCID 不进任何结果。
     """
     if not pmc_ids:
-        return {}
+        return {}, []
 
     uniq_pmc_ids = list(dict.fromkeys(pmc_ids))
     cached_links = cached_links or {}
@@ -266,7 +276,7 @@ def fetch_oa_links(
 
     missing = [pmc_id for pmc_id in uniq_pmc_ids if pmc_id not in oa_map]
     if not missing:
-        return oa_map
+        return oa_map, []
 
     logger.info(f"需要远程查询 {len(missing)} 个 PMCID（并发 {OA_FETCH_MAX_WORKERS} 线程，请求间隔 {REQUEST_INTERVAL}s）...")
 
@@ -282,6 +292,9 @@ def fetch_oa_links(
             last_ts[0] = time.time()
         return _fetch_single_oa_link(pmc_id)
 
+    network_failed: list[str] = []
+    not_oa_count = 0
+
     with ThreadPoolExecutor(max_workers=OA_FETCH_MAX_WORKERS) as executor:
         future_to_pmc = {
             executor.submit(_rate_limited_fetch, pid): pid
@@ -289,13 +302,22 @@ def fetch_oa_links(
         }
 
         for i, future in enumerate(as_completed(future_to_pmc), 1):
-            pid, links = future.result()
-            if links:
+            pid, links, status = future.result()
+            if status == "ok" and links:
                 oa_map[pid] = links
+            elif status == "network_fail":
+                network_failed.append(pid)
+            else:
+                not_oa_count += 1
             if i % 20 == 0 or i == len(missing):
                 logger.info(f"  获取 OA 链接进度: {i}/{len(missing)}")
 
-    return oa_map
+    if not_oa_count:
+        logger.info(f"  其中 {not_oa_count} 篇为非 OA 文献（无 OA 全文，正常跳过）。")
+    if network_failed:
+        logger.warning(f"  网络失败 {len(network_failed)} 篇，将进入待重试清单（可 --step pdf-retry 续跑）。")
+
+    return oa_map, network_failed
 
 
 def fetch_pdf_urls(pmc_ids: list[str]) -> dict[str, str]:
@@ -304,7 +326,7 @@ def fetch_pdf_urls(pmc_ids: list[str]) -> dict[str, str]:
     返回 {pmc_id: pdf_url} 字典。
     """
     cached_links = load_cached_oa_links(pmc_ids)
-    oa_links = fetch_oa_links(pmc_ids, cached_links=cached_links)
+    oa_links, _ = fetch_oa_links(pmc_ids, cached_links=cached_links)
     return {pmc_id: links["pdf"] for pmc_id, links in oa_links.items() if "pdf" in links}
 
 
@@ -453,8 +475,10 @@ def _run_aria2c_download(url: str, output_path: Path, timeout_sec: int = 300) ->
         "-k", ARIA2C_MIN_SPLIT_SIZE,
         "-d", str(output_path.parent),
         "-o", output_path.name,
-        url,
     ]
+    if PROXY:
+        cmd.append(f"--all-proxy={PROXY}")
+    cmd.append(url)
 
     try:
         completed = subprocess.run(
@@ -483,6 +507,15 @@ def _run_aria2c_download(url: str, output_path: Path, timeout_sec: int = 300) ->
 
     return output_path.exists()
 
+def _cleanup_aria2_temp_files(temp_path: Path) -> None:
+    """删除 aria2 下载中断残留的临时文件（含 .part.aria2 控制文件）。"""
+    if temp_path.exists():
+        temp_path.unlink()
+    aria2_control = temp_path.with_name(temp_path.name + ".aria2")
+    if aria2_control.exists():
+        aria2_control.unlink()
+
+
 def download_pdf_file(url: str, dest_path: Path) -> bool:
     """
     下载单个 PDF 文件，支持断点续传（检查是否存在）。
@@ -507,8 +540,7 @@ def download_pdf_file(url: str, dest_path: Path) -> bool:
     except Exception as e:
         logger.error(f"  下载失败: {url} -> {e}")
 
-        if temp_path.exists():
-            temp_path.unlink()
+        _cleanup_aria2_temp_files(temp_path)
         if dest_path.exists() and dest_path.stat().st_size <= MIN_VALID_FILE_BYTES:
             dest_path.unlink()
 
@@ -543,6 +575,62 @@ def _select_article_pdf_member(members: list) -> tarfile.TarInfo | None:
     return pdf_members[0]
 
 
+def extract_nxml_to_txt(tgz_path: Path, txt_path: Path) -> bool:
+    """
+    从 OA tgz 包中提取 nxml 正文全文并转存为纯文本 txt。
+    包内无 nxml 时返回 False（极端情况，视为失败）。
+    """
+    try:
+        nxml_name = None
+        with tarfile.open(tgz_path, mode="r:gz") as tar:
+            for m in tar.getmembers():
+                if m.isfile() and m.name.lower().endswith(".nxml"):
+                    nxml_name = m.name
+                    break
+            if nxml_name is None:
+                logger.warning(f"  tgz 包内未找到 nxml: {tgz_path}")
+                return False
+            nxml_bytes = tar.extractfile(nxml_name).read()
+
+        root = etree.fromstring(nxml_bytes, parser=etree.XMLParser(recover=True))
+        lines: list[str] = []
+
+        title_el = root.find(".//article-title")
+        if title_el is not None:
+            lines.append("TITLE: " + "".join(title_el.itertext()).strip())
+            lines.append("")
+
+        body = root.find(".//body")
+        if body is not None:
+            for sec in body.iter():
+                tag = etree.QName(sec).localname if isinstance(sec.tag, str) else ""
+                if tag == "title":
+                    lines.append("")
+                    lines.append("### " + "".join(sec.itertext()).strip())
+                elif tag == "p":
+                    text = "".join(sec.itertext()).strip()
+                    if text:
+                        lines.append(text)
+                elif tag == "table-wrap":
+                    for tr in sec.findall(".//tr"):
+                        cells = [
+                            "".join(td.itertext()).strip()
+                            for td in tr.findall("td")
+                        ]
+                        if cells:
+                            lines.append(" | ".join(cells))
+
+        if not lines:
+            return False
+
+        txt_path.parent.mkdir(parents=True, exist_ok=True)
+        txt_path.write_text("\n".join(lines), encoding="utf-8")
+        return True
+    except Exception as e:
+        logger.error(f"  NXML->TXT 提取失败: {tgz_path} -> {e}")
+        return False
+
+
 def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
     """
     从 OA tgz 包中提取 PDF，并保存为 .pdf。
@@ -565,7 +653,14 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
             pdf_member = _select_article_pdf_member(tar.getmembers())
 
             if pdf_member is None:
-                raise RuntimeError("tgz 包内未找到 PDF 文件")
+                # 包内无 PDF（仅 nxml）时回退：提取 XML 全文转 txt
+                txt_path = dest_path.with_suffix(".txt")
+                logger.info(f"  tgz 包内无 PDF，尝试提取 XML 全文: {txt_path.name}")
+                tar.close()
+                if extract_nxml_to_txt(tgz_temp_path, txt_path):
+                    logger.info(f"  该文献无 PDF 全文，已提取 XML 全文: {txt_path}")
+                    return True
+                raise RuntimeError("tgz 包内未找到 PDF 且 XML 全文提取失败")
 
             extracted = tar.extractfile(pdf_member)
             if extracted is None:
@@ -585,14 +680,12 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
         return True
     except Exception as e:
         logger.error(f"  TGZ->PDF 提取失败: {url} -> {e}")
-        if temp_path.exists():
-            temp_path.unlink()
+        _cleanup_aria2_temp_files(temp_path)
         if dest_path.exists() and dest_path.stat().st_size <= MIN_VALID_FILE_BYTES:
             dest_path.unlink()
         return False
     finally:
-        if tgz_temp_path.exists():
-            tgz_temp_path.unlink()
+        _cleanup_aria2_temp_files(tgz_temp_path)
 
 
 def download_oa_pdf(links: dict[str, str], pdf_path: Path) -> bool:
@@ -658,7 +751,7 @@ def run_pdf_download(db_path: Path = DB_PATH):
     if cached_oa_links:
         logger.info(f"复用历史已获取链接 {len(cached_oa_links)} 条。")
 
-    oa_links = fetch_oa_links(pmc_ids, cached_links=cached_oa_links)
+    oa_links, network_failed = fetch_oa_links(pmc_ids, cached_links=cached_oa_links)
     pdf_link_count = sum(1 for links in oa_links.values() if "pdf" in links)
     tgz_link_count = sum(1 for links in oa_links.values() if "tgz" in links)
 
@@ -668,6 +761,17 @@ def run_pdf_download(db_path: Path = DB_PATH):
 
     links_csv = export_oa_links_csv(oa_links=oa_links, pmc_to_info=pmc_to_info)
     logger.info(f"已导出下载链接清单: {links_csv}")
+
+    # 网络失败项并入 failed_items，后续 --step pdf-retry 重新查链并下载
+    network_failed_items: list[dict] = []
+    for pid in network_failed:
+        info = pmc_to_info.get(pid, {})
+        network_failed_items.append({
+            "pmc_id": pid,
+            "links": {},
+            "pdf_path": PDF_DIR / f"{info.get('pmid', '')}.pdf",
+            "pmid": info.get("pmid", ""),
+        })
 
     # 3. 执行下载
     pdf_success_count = 0
@@ -712,21 +816,28 @@ def run_pdf_download(db_path: Path = DB_PATH):
             if pdf_success_count > 0 and pdf_success_count % 10 == 0:
                 logger.info(f"  已下载 {pdf_success_count} 篇 PDF...")
 
+    # 网络失败项（无链接）计入失败清单，待 --step pdf-retry 重查链接
+    failed_items = network_failed_items + failed_items
+    failed_count += len(network_failed_items)
+
     logger.info(
         f"首次下载完成：PDF {pdf_success_count} 篇，"
         f"失败 {failed_count} 篇，跳过 {skip_count} 篇。"
     )
 
     # 4. 重试下载失败的链接（最多 2 次）
+    # 网络失败项无链接，跳过自动重试，交由 --step pdf-retry 重查链接
+    retryable = [item for item in failed_items if item["links"]]
+    non_retryable = [item for item in failed_items if not item["links"]]
     MAX_RETRIES = 2
     retry_round = 0
-    while failed_items and retry_round < MAX_RETRIES:
+    while retryable and retry_round < MAX_RETRIES:
         retry_round += 1
         retry_success_pdf = 0
         retry_fail: list[dict] = []
 
         logger.info(
-            f"重试第 {retry_round}/{MAX_RETRIES} 轮，剩余 {len(failed_items)} 篇待重试..."
+            f"重试第 {retry_round}/{MAX_RETRIES} 轮，剩余 {len(retryable)} 篇（有链接）待重试..."
         )
 
         with ThreadPoolExecutor(max_workers=DOWNLOAD_MAX_WORKERS) as executor:
@@ -736,7 +847,7 @@ def run_pdf_download(db_path: Path = DB_PATH):
                     item["links"],
                     item["pdf_path"],
                 ): item
-                for item in failed_items
+                for item in retryable
             }
 
             for future in as_completed(retry_future_to_meta):
@@ -746,7 +857,8 @@ def run_pdf_download(db_path: Path = DB_PATH):
                 else:
                     retry_fail.append(retry_future_to_meta[future])
 
-        failed_items = retry_fail
+        failed_items = non_retryable + retry_fail
+        retryable = retry_fail
         logger.info(
             f"重试第 {retry_round} 轮完成：PDF {retry_success_pdf} 篇，"
             f"仍失败 {len(failed_items)} 篇。"
@@ -807,7 +919,7 @@ def run_pdf_retry(db_path: Path = DB_PATH):
         missing_pmcs = [item["pmc_id"] for item in missing if item.get("pmc_id")]
         if missing_pmcs:
             logger.info(f"需重新查询 OA 链接 {len(missing_pmcs)} 篇...")
-            oa_links = fetch_oa_links(missing_pmcs)
+            oa_links, _ = fetch_oa_links(missing_pmcs)
             for item in pending:
                 if not item.get("links"):
                     item["links"] = oa_links.get(item.get("pmc_id"), {})

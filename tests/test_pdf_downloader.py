@@ -53,7 +53,7 @@ class TestFetchOaLinks(unittest.TestCase):
             resp.raise_for_status = Mock()
             return resp
 
-        def fake_get(_url, params=None, timeout=30):
+        def fake_get(_url, params=None, timeout=30, **kwargs):
             self.assertEqual(timeout, 30)
             if params.get("id") == "PMC4334330":
                 return build_resp(
@@ -68,7 +68,7 @@ class TestFetchOaLinks(unittest.TestCase):
 
         mock_get.side_effect = fake_get
 
-        result = fetch_oa_links(["PMC4334330", "PMCXXXX"])
+        result, failed = fetch_oa_links(["PMC4334330", "PMCXXXX"])
 
         self.assertEqual(
             result["PMC4334330"]["pdf"],
@@ -79,6 +79,7 @@ class TestFetchOaLinks(unittest.TestCase):
             "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_package/a/b/PMC4334330.tar.gz",
         )
         self.assertNotIn("PMCXXXX", result)
+        self.assertEqual(failed, [])
         self.assertEqual(mock_get.call_count, 2)
 
     @patch("downloader.pdf_downloader.time.sleep")
@@ -91,7 +92,7 @@ class TestFetchOaLinks(unittest.TestCase):
             resp.raise_for_status = Mock()
             return resp
 
-        def fake_get(_url, params=None, timeout=30):
+        def fake_get(_url, params=None, timeout=30, **kwargs):
             if params == {"id": "PMC1"}:
                 return build_resp(
                     "<OA><records><record id='PMC1'>"
@@ -110,7 +111,7 @@ class TestFetchOaLinks(unittest.TestCase):
 
         mock_get.side_effect = fake_get
 
-        result = fetch_oa_links(["PMC1", "PMC2"])
+        result, _failed = fetch_oa_links(["PMC1", "PMC2"])
 
         self.assertIn("PMC1", result)
         self.assertIn("PMC2", result)
@@ -118,7 +119,7 @@ class TestFetchOaLinks(unittest.TestCase):
 
     @patch("downloader.pdf_downloader.requests.get")
     def test_should_reuse_cached_links_without_remote_fetch(self, mock_get):
-        result = fetch_oa_links(
+        result, _failed = fetch_oa_links(
             ["PMC1"],
             cached_links={"PMC1": {"pdf": "https://example.org/1.pdf"}},
         )
@@ -181,6 +182,93 @@ class TestDownloadPdfFromTgz(unittest.TestCase):
             self.assertTrue(ok)
             self.assertTrue(dest.exists())
             self.assertGreater(dest.stat().st_size, 1024)
+
+
+class TestDownloadPdfFromTgzTxtFallback(unittest.TestCase):
+    """tgz 包内无 PDF 时回退提取 nxml 转 txt"""
+
+    def _make_tgz(self, members: list[tuple[str, bytes]]) -> bytes:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name, data in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    def _fake_run(self, tgz_bytes):
+        def fake_run(cmd, capture_output=True, text=True, timeout=300, check=False):
+            out_dir = Path(cmd[cmd.index("-d") + 1])
+            out_name = cmd[cmd.index("-o") + 1]
+            out_path = out_dir / out_name
+            out_path.write_bytes(tgz_bytes)
+            return Mock(returncode=0, stderr="", stdout="")
+        return fake_run
+
+    NXML = b"""<?xml version="1.0"?>
+<article xmlns:xlink="http://www.w3.org/1999/xlink">
+  <front><article-meta>
+    <title-group><article-title>Potato CDF1 and drought</article-title></title-group>
+  </article-meta></front>
+  <body>
+    <sec><title>Introduction</title>
+      <p>Potato is an important crop.</p>
+    </sec>
+    <sec><title>Results</title>
+      <p>We found interesting results.</p>
+      <table-wrap><table><tr><td>a</td><td>b</td></tr></table></table-wrap>
+    </sec>
+  </body>
+</article>"""
+
+    @patch("downloader.pdf_downloader.subprocess.run")
+    def test_should_extract_txt_when_no_pdf_in_tgz(self, mock_run):
+        tgz_bytes = self._make_tgz([
+            ("PMC1/main.nxml", self.NXML),
+            ("PMC1/fig1.jpg", b"jpegdata"),
+        ])
+        mock_run.side_effect = self._fake_run(tgz_bytes)
+
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "out.pdf"
+            ok = download_pdf_from_tgz("https://example.org/a.tgz", dest)
+
+            txt_path = Path(td) / "out.txt"
+            self.assertTrue(ok)
+            self.assertFalse(dest.exists())
+            self.assertTrue(txt_path.exists())
+            content = txt_path.read_text(encoding="utf-8")
+            self.assertIn("Potato is an important crop.", content)
+            self.assertIn("Introduction", content)
+
+    @patch("downloader.pdf_downloader.subprocess.run")
+    def test_should_still_extract_pdf_when_pdf_present(self, mock_run):
+        pdf_payload = b"%PDF-1.4\n" + (b"A" * 3000)
+        tgz_bytes = self._make_tgz([
+            ("PMC1/main.pdf", pdf_payload),
+            ("PMC1/main.nxml", self.NXML),
+        ])
+        mock_run.side_effect = self._fake_run(tgz_bytes)
+
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "out.pdf"
+            ok = download_pdf_from_tgz("https://example.org/a.tgz", dest)
+
+            self.assertTrue(ok)
+            self.assertTrue(dest.exists())
+            self.assertFalse((Path(td) / "out.txt").exists())
+
+    @patch("downloader.pdf_downloader.subprocess.run")
+    def test_should_fail_when_no_pdf_and_no_nxml(self, mock_run):
+        tgz_bytes = self._make_tgz([("fig1.jpg", b"jpegdata")])
+        mock_run.side_effect = self._fake_run(tgz_bytes)
+
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "out.pdf"
+            ok = download_pdf_from_tgz("https://example.org/a.tgz", dest)
+
+            self.assertFalse(ok)
+            self.assertFalse((Path(td) / "out.txt").exists())
 
 
 class TestDownloadPdfFromTgzPicksArticlePdf(unittest.TestCase):
@@ -322,6 +410,212 @@ class TestAria2Download(unittest.TestCase):
             ok = download_pdf_file("https://example.org/paper.pdf", dest)
 
         self.assertFalse(ok)
+
+    @patch("downloader.pdf_downloader.subprocess.run")
+    def test_should_clean_aria2_control_file_on_failure(self, mock_run):
+        mock_run.return_value = Mock(returncode=1, stderr="network error", stdout="")
+
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "paper.pdf"
+            control = Path(td) / "paper.pdf.part.aria2"
+            control.write_bytes(b"\x00" * 64)
+
+            ok = download_pdf_file("https://example.org/paper.pdf", dest)
+
+            self.assertFalse(ok)
+            self.assertFalse(control.exists())
+            self.assertFalse((Path(td) / "paper.pdf.part").exists())
+
+
+class TestAria2Proxy(unittest.TestCase):
+    @patch("downloader.pdf_downloader.subprocess.run")
+    def test_should_append_proxy_arg_when_configured(self, mock_run):
+        payload = b"%PDF-1.4\n" + (b"B" * 3000)
+
+        def fake_run(cmd, capture_output=True, text=True, timeout=300, check=False):
+            out_dir = Path(cmd[cmd.index("-d") + 1])
+            out_name = cmd[cmd.index("-o") + 1]
+            (out_dir / out_name).write_bytes(payload)
+            return Mock(returncode=0, stderr="", stdout="")
+
+        mock_run.side_effect = fake_run
+        with tempfile.TemporaryDirectory() as td:
+            with patch("downloader.pdf_downloader.PROXY", "http://127.0.0.1:7890"):
+                ok = download_pdf_file("https://example.org/1.pdf", Path(td) / "1.pdf")
+
+        self.assertTrue(ok)
+        called_cmd = mock_run.call_args.args[0]
+        self.assertIn("--all-proxy=http://127.0.0.1:7890", called_cmd)
+
+    @patch("downloader.pdf_downloader.subprocess.run")
+    def test_should_not_append_proxy_arg_when_not_configured(self, mock_run):
+        payload = b"%PDF-1.4\n" + (b"B" * 3000)
+
+        def fake_run(cmd, capture_output=True, text=True, timeout=300, check=False):
+            out_dir = Path(cmd[cmd.index("-d") + 1])
+            out_name = cmd[cmd.index("-o") + 1]
+            (out_dir / out_name).write_bytes(payload)
+            return Mock(returncode=0, stderr="", stdout="")
+
+        mock_run.side_effect = fake_run
+        with tempfile.TemporaryDirectory() as td:
+            with patch("downloader.pdf_downloader.PROXY", None):
+                ok = download_pdf_file("https://example.org/2.pdf", Path(td) / "2.pdf")
+
+        self.assertTrue(ok)
+        called_cmd = mock_run.call_args.args[0]
+        self.assertNotIn("--all-proxy", " ".join(called_cmd))
+
+
+class TestFetchOaLinksProxy(unittest.TestCase):
+    @patch("downloader.pdf_downloader.time.sleep")
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_pass_proxies_to_requests_when_configured(self, mock_get, _sleep):
+        captured = {}
+
+        def fake_get(url, **kwargs):
+            captured.update(kwargs)
+            resp = Mock()
+            resp.status_code = 200
+            resp.content = (
+                "<OA><records><record id='PMC123'>"
+                "<link format='pdf' href='https://example.org/1.pdf'/>"
+                "</record></records></OA>"
+            ).encode()
+            resp.raise_for_status = Mock()
+            return resp
+
+        mock_get.side_effect = fake_get
+        with patch("downloader.pdf_downloader.PROXY", "http://127.0.0.1:7890"):
+            result, _failed = fetch_oa_links(["PMC123"])
+
+        self.assertIn("PMC123", result)
+        self.assertEqual(
+            captured["proxies"],
+            {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"},
+        )
+
+    @patch("downloader.pdf_downloader.time.sleep")
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_not_pass_proxies_when_not_configured(self, mock_get, _sleep):
+        captured = {}
+
+        def fake_get(url, **kwargs):
+            captured.update(kwargs)
+            resp = Mock()
+            resp.status_code = 200
+            resp.content = (
+                "<record><link format='pdf' href='https://example.org/2.pdf'/></record>"
+            ).encode()
+            resp.raise_for_status = Mock()
+            return resp
+
+        mock_get.side_effect = fake_get
+        with patch("downloader.pdf_downloader.PROXY", None):
+            fetch_oa_links(["PMC456"])
+
+        self.assertNotIn("proxies", captured)
+
+
+class TestFetchSingleOaLinkClassification(unittest.TestCase):
+    def _resp(self, xml_text: str):
+        resp = Mock()
+        resp.status_code = 200
+        resp.content = xml_text.encode("utf-8")
+        resp.raise_for_status = Mock()
+        return resp
+
+    @patch("downloader.pdf_downloader._request_oa_with_retry")
+    def test_should_classify_ok_when_record_with_links(self, mock_req):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+
+        mock_req.return_value = self._resp(
+            "<OA><records><record id='PMC1'>"
+            "<link format='pdf' href='https://a/1.pdf'/>"
+            "<link format='tgz' href='https://a/1.tgz'/>"
+            "</record></records></OA>"
+        )
+
+        pid, links, status = _fetch_single_oa_link("PMC1")
+
+        self.assertEqual(pid, "PMC1")
+        self.assertEqual(links, {"pdf": "https://a/1.pdf", "tgz": "https://a/1.tgz"})
+        self.assertEqual(status, "ok")
+
+    @patch("downloader.pdf_downloader._request_oa_with_retry")
+    def test_should_classify_not_oa_when_open_access_error(self, mock_req):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+
+        mock_req.return_value = self._resp(
+            "<OA><error code='idIsNotOpenAccess'>PMC1 is not Open Access</error></OA>"
+        )
+        pid, links, status = _fetch_single_oa_link("PMC1")
+        self.assertEqual(status, "not_oa")
+        self.assertIsNone(links)
+
+    @patch("downloader.pdf_downloader._request_oa_with_retry")
+    def test_should_classify_not_oa_when_id_does_not_exist(self, mock_req):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+
+        mock_req.return_value = self._resp(
+            "<OA><error code='idDoesNotExist'>PMC9 does not exist</error></OA>"
+        )
+        pid, links, status = _fetch_single_oa_link("PMC9")
+        self.assertEqual(status, "not_oa")
+        self.assertIsNone(links)
+
+    @patch("downloader.pdf_downloader._request_oa_with_retry")
+    def test_should_classify_network_fail_when_request_failed(self, mock_req):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+
+        mock_req.return_value = None
+        pid, links, status = _fetch_single_oa_link("PMC2")
+        self.assertEqual(status, "network_fail")
+        self.assertIsNone(links)
+
+    @patch("downloader.pdf_downloader._request_oa_with_retry")
+    def test_should_classify_network_fail_when_no_record_no_error(self, mock_req):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+
+        mock_req.return_value = self._resp("<OA></OA>")
+        pid, links, status = _fetch_single_oa_link("PMC3")
+        self.assertEqual(status, "network_fail")
+        self.assertIsNone(links)
+
+
+class TestFetchOaLinksClassification(unittest.TestCase):
+    @patch("downloader.pdf_downloader.time.sleep")
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_return_network_failed_ids_and_exclude_not_oa(self, mock_get, _sleep):
+        captured = {}
+
+        def fake_get(url, **kwargs):
+            captured.setdefault("count", 0)
+            captured["count"] += 1
+            pid = (kwargs.get("params") or {}).get("id")
+            resp = Mock()
+            resp.status_code = 200
+            resp.raise_for_status = Mock()
+            if pid == "PMC_OK":
+                resp.content = (
+                    "<record><link format='pdf' href='https://a/ok.pdf'/></record>"
+                ).encode("utf-8")
+            elif pid == "PMC_NOT_OA":
+                resp.content = (
+                    "<OA><error code='idIsNotOpenAccess'>x</error></OA>"
+                ).encode("utf-8")
+            else:
+                resp.content = b"<OA></OA>"
+            return resp
+
+        mock_get.side_effect = fake_get
+
+        result, failed = fetch_oa_links(["PMC_OK", "PMC_NOT_OA", "PMC_NET"])
+
+        self.assertIn("PMC_OK", result)
+        self.assertNotIn("PMC_NOT_OA", result)
+        self.assertEqual(failed, ["PMC_NET"])
+        self.assertEqual(captured["count"], 3)
 
 
 class TestExportOaLinksCsv(unittest.TestCase):
@@ -478,7 +772,7 @@ class TestRunPdfRetry(unittest.TestCase):
         mock_csv, mock_checkpoint,
     ):
         mock_dl.return_value = True
-        mock_fetch.return_value = {}
+        mock_fetch.return_value = ({}, [])
         with tempfile.TemporaryDirectory() as td:
             pdf_dir = Path(td)
             (pdf_dir / "222.pdf").write_bytes(b"%PDF-1.4\n" + b"A" * 2000)
@@ -510,7 +804,7 @@ class TestRunPdfRetry(unittest.TestCase):
             {"pmid": "333", "pmc_id": "PMC3", "links": {"pdf": "https://a/3.pdf"}},
             {"pmid": "444", "pmc_id": "PMC4", "links": {"pdf": "https://a/4.pdf"}},
         ]
-        mock_fetch.return_value = {}
+        mock_fetch.return_value = ({}, [])
         mock_dl.return_value = False
         mock_export.return_value = Path("failed_downloads_x.csv")
         with tempfile.TemporaryDirectory() as td:
@@ -537,7 +831,7 @@ class TestRunPdfRetry(unittest.TestCase):
             {"pmid": str(i), "pmc_id": f"PMC{i}", "links": {"pdf": f"https://a/{i}.pdf"}}
             for i in range(1, 16)
         ]
-        mock_fetch.return_value = {}
+        mock_fetch.return_value = ({}, [])
         mock_dl.side_effect = lambda links, pdf_path: Path(pdf_path).name in {
             f"{i}.pdf" for i in range(1, 11)
         }
@@ -584,7 +878,7 @@ class TestRunPdfWriteCheckpoint(unittest.TestCase):
     def test_should_write_checkpoint_on_failure(
         self, mock_export_csv, mock_cached, mock_dl, mock_fetch,
     ):
-        mock_fetch.return_value = {"PMC1": {"pdf": "https://a/1.pdf"}}
+        mock_fetch.return_value = ({"PMC1": {"pdf": "https://a/1.pdf"}}, [])
         mock_dl.return_value = False
         mock_export_csv.return_value = Path("links.csv")
         with tempfile.TemporaryDirectory() as td:
@@ -614,7 +908,7 @@ class TestRunPdfWriteCheckpoint(unittest.TestCase):
     def test_should_clear_checkpoint_on_success(
         self, mock_export_csv, mock_cached, mock_dl, mock_fetch,
     ):
-        mock_fetch.return_value = {"PMC1": {"pdf": "https://a/1.pdf"}}
+        mock_fetch.return_value = ({"PMC1": {"pdf": "https://a/1.pdf"}}, [])
         mock_dl.return_value = True
         mock_export_csv.return_value = Path("links.csv")
         with tempfile.TemporaryDirectory() as td:
@@ -638,7 +932,7 @@ class TestRunPdfWriteCheckpoint(unittest.TestCase):
     def test_should_keep_checkpoint_when_no_task(
         self, mock_export_csv, mock_cached, mock_fetch,
     ):
-        mock_fetch.return_value = {}
+        mock_fetch.return_value = ({}, [])
         mock_export_csv.return_value = Path("links.csv")
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)

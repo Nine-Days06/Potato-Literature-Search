@@ -50,7 +50,7 @@ Potato-Literature-Search/
 │   ├── raw_xml/                 # 原始 XML 文件
 │   ├── processed/               # SQLite 数据库（potato_lit.db）
 │   ├── output/                  # CSV 输出
-│   └── pdfs/                    # LLM 判定相关文献的 PDF 全文
+│   └── pdfs/                    # LLM 判定相关文献的 PDF 全文（无 PDF 时 .txt）
 ├── logs/                        # 运行日志
 ├── tests/                       # 单元测试
 ├── main.py                      # 一键运行入口
@@ -102,6 +102,7 @@ pip install -r requirements.txt
 
 # 2. 配置 API Key
 #    复制 config/.env.example 为 config/.env，填入你的真实密钥
+#    可选：设置 PROXY=http://127.0.0.1:7890 走代理访问 NCBI 等外网（留空直连）
 #    .env 已加入 .gitignore，不会误提交
 
 # 3. 运行核心流程（下载 → 解析 → 硬过滤）
@@ -185,5 +186,5 @@ python main.py --query "potato AND drought AND gene"
 | `data/output/failed_downloads_*.csv` | PDF 下载失败链接清单（供 `--step pdf-retry` 续跑） |
 | `data/output/pdf_download_progress.json` | PDF 重试断点（中断后自动恢复） |
 | `data/output/oa_download_links_*.csv` | OA 资源下载链接清单 |
-| `data/pdfs/` | LLM 判定相关文献的 PDF 全文文件 |
+| `data/pdfs/` | LLM 判定相关文献的 PDF 全文文件（tgz 包内无 PDF 时回退保存 `.txt` 文本全文） |
 | `logs/` | 各模块运行日志（按名称+日期分文件） |
