@@ -197,22 +197,31 @@ python main.py --query "potato AND drought AND gene"
 当优化搜索词（`config/settings.py` 中的 `PUBMED_QUERY`）或扩大年份范围时，使用增量流水线仅处理新增文献，避免全量重跑：
 
 ```bash
-# 1. 完整增量更新（搜索词优化 + 年份扩大）
-python scripts/incremental_update.py --query "NEW_OPTIMIZED_QUERY" --year-min 2015
+# 1. 仅核心三步（下载 → 解析 → 硬过滤）——最常用，对齐 main.py --step all
+python scripts/incremental_update.py
 
-# 2. 仅年份扩大（如 2020-2026 -> 2015-2026）
+# 2. 核心三步 + LLM 验证（对齐 main.py --step validate）
+python scripts/incremental_update.py --validate
+
+# 3. 核心三步 + 验证 + 导出（完整增量，对齐 main.py --step validate --step export）
+python scripts/incremental_update.py --validate --export
+
+# 4. 搜索词优化 + 年份扩大 + 完整增量
+python scripts/incremental_update.py --query "NEW_QUERY" --year-min 2015 --validate --export
+
+# 5. 仅年份扩大（核心三步）
 python scripts/incremental_update.py --year-min 2015
 
-# 3. 下载解析已手动跑过，只跑后续
-python scripts/incremental_update.py --skip-download --skip-parse
+# 6. 下载解析已手动跑过，只跑验证
+python scripts/incremental_update.py --skip-download --skip-parse --validate
 
-# 4. 使用智谱 Batch API 加速新增文献验证
-python scripts/incremental_update.py --batch
+# 7. 使用智谱 Batch API 加速验证
+python scripts/incremental_update.py --validate --batch
 
-# 5. 仅增量导出（指定时间戳后新增的复核通过文献）
-python scripts/incremental_update.py --skip-download --skip-llm --export-since "2025-08-01T00:00:00"
+# 8. 仅增量导出（指定时间戳后新增的复核通过文献）
+python scripts/incremental_update.py --export-since "2025-08-01T00:00:00"
 
-# 6. 标记因查询词变化不再匹配的旧 PMID（可选，软保留不删除）
+# 9. 标记因查询词变化不再匹配的旧 PMID（可选，软保留不删除）
 python scripts/incremental_update.py --mark-removed
 ```
 
