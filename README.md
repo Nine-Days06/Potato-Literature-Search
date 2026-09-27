@@ -183,8 +183,47 @@ python main.py --query "potato AND drought AND gene"
 | `data/output/llm_validation_failed_*.csv` | LLM 校验失败 PMID 清单 |
 | `data/output/llm_filtered_*.csv` | LLM + 人工复核后的最终过滤结果 |
 | `data/output/articles_raw_*.csv` | 复核通过文献的原始信息（不含 raw_xml_file、LLM/复核列） |
+| `data/output/articles_raw_incremental_*.csv` | **增量导出**：指定时间后新增的复核通过文献原始信息 |
 | `data/output/failed_downloads_*.csv` | PDF 下载失败链接清单（供 `--step pdf-retry` 续跑） |
 | `data/output/pdf_download_progress.json` | PDF 重试断点（中断后自动恢复） |
 | `data/output/oa_download_links_*.csv` | OA 资源下载链接清单 |
 | `data/pdfs/` | LLM 判定相关文献的 PDF 全文文件（tgz 包内无 PDF 时回退保存 `.txt` 文本全文） |
 | `logs/` | 各模块运行日志（按名称+日期分文件） |
+
+---
+
+## 增量更新（搜索词/年份变更后）
+
+当优化搜索词（`config/settings.py` 中的 `PUBMED_QUERY`）或扩大年份范围时，使用增量流水线仅处理新增文献，避免全量重跑：
+
+```bash
+# 1. 完整增量更新（搜索词优化 + 年份扩大）
+python scripts/incremental_update.py --query "NEW_OPTIMIZED_QUERY" --year-min 2015
+
+# 2. 仅年份扩大（如 2020-2026 -> 2015-2026）
+python scripts/incremental_update.py --year-min 2015
+
+# 3. 下载解析已手动跑过，只跑后续
+python scripts/incremental_update.py --skip-download --skip-parse
+
+# 4. 使用智谱 Batch API 加速新增文献验证
+python scripts/incremental_update.py --batch
+
+# 5. 仅增量导出（指定时间戳后新增的复核通过文献）
+python scripts/incremental_update.py --skip-download --skip-llm --export-since "2025-08-01T00:00:00"
+
+# 6. 标记因查询词变化不再匹配的旧 PMID（可选，软保留不删除）
+python scripts/incremental_update.py --mark-removed
+```
+
+### 增量更新原理
+
+| 阶段 | 增量策略 |
+|------|----------|
+| **下载** | 对比 `pmid_list.json`，仅下载 `新查询词结果 - 旧结果` 的差集 PMID |
+| **解析** | `INSERT OR IGNORE` 自动去重，无需额外处理 |
+| **硬过滤** | 仅扫描 `filter_log` 中无记录的新 PMID，重复标题全量对比但只标记新增 |
+| **LLM 验证** | 原生跳过已验证/已过滤 PMID，自动增量 |
+| **导出** | 按 `validated_at` 时间戳筛选，文件名含 `incremental` 标识 |
+
+> **注意**：增量下载会更新 `data/raw_xml/pmid_list.json`（覆盖为新查询词的全量 PMID 列表），旧数据库记录保留，通过 `filter_log.stage='query_removed'` 标记被新查询词排除的旧 PMID。

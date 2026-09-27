@@ -19,3 +19,6 @@ logs/
 # Documentation
 AGENTS.md
 docs/
+
+# OpenCode
+.omo/

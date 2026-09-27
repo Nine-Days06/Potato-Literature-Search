@@ -1436,3 +1436,58 @@ def _export_raw_csv(db_path: Path = DB_PATH) -> Path | None:
 
     logger.info(f"原始文献信息已导出: {csv_path} ({len(rows)} 篇)")
     return csv_path
+
+
+def export_incremental_raw_csv(since_timestamp: str = None, db_path: Path = DB_PATH) -> Path | None:
+    """
+    增量导出：导出指定时间后新增的、复核通过的文献原始信息。
+    
+    Args:
+        since_timestamp: ISO 格式时间字符串，如 '2025-08-01T00:00:00'。
+                         仅导出 validated_at > since_timestamp 的记录。
+                         None 则导出所有（等同于 _export_raw_csv）。
+        db_path: 数据库路径
+    
+    Returns:
+        导出的 CSV 文件路径，无数据则返回 None
+    """
+    where_clause = ""
+    params = []
+    if since_timestamp:
+        where_clause = "AND v.validated_at > ?"
+        params.append(since_timestamp)
+    
+    query = f"""
+        SELECT a.pmid, a.title, a.abstract, a.keywords, a.mesh_terms,
+               a.pub_year, a.pub_month, a.journal, a.journal_abbr, a.doi,
+               a.pmc_id, a.article_types, a.authors, a.affiliation,
+               a.language
+        FROM articles a
+        JOIN llm_validation v ON a.pmid = v.pmid
+        WHERE (v.human_review = 'Y'
+            OR (v.human_review IS NULL AND v.llm_verdict = 'RELEVANT'))
+          {where_clause}
+        ORDER BY v.validated_at
+    """
+    
+    with get_conn(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+    
+    if not rows:
+        logger.info(f"增量导出: 无新增符合条件的记录 (since={since_timestamp})")
+        return None
+    
+    out_dir = Path(OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = f"_since_{since_timestamp.replace(':', '-').replace('T', '_')}" if since_timestamp else ""
+    csv_path = out_dir / f"articles_raw_incremental{suffix}_{ts}.csv"
+    
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=RAW_EXPORT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(dict(row))
+    
+    logger.info(f"增量导出原始文献信息: {csv_path} ({len(rows)} 篇, since={since_timestamp})")
+    return csv_path

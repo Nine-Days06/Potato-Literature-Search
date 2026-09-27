@@ -218,3 +218,107 @@ def get_passed_pmids(db_path: Path = DB_PATH, conn: sqlite3.Connection = None) -
         with get_conn(db_path) as c:
             rows = c.execute(query).fetchall()
     return [r["pmid"] for r in rows]
+
+
+# ── 增量硬过滤 ────────────────────────────────────────────────
+
+def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
+    """
+    增量硬过滤：仅对未做过硬过滤的 PMID 执行过滤。
+    不清空 filter_log，只处理增量部分。
+    重复标题检测仍需全量扫描（涉及旧文献），但只标记新 PMID。
+    """
+    db_path = Path(db_path)
+    logger.info("=" * 60)
+    logger.info("阶段三-A：增量硬过滤")
+    logger.info("=" * 60)
+
+    with get_conn(db_path) as conn:
+        # 找出 articles 中没有 hard_filter 日志的 PMID
+        rows = conn.execute("""
+            SELECT * FROM articles a
+            WHERE NOT EXISTS (
+                SELECT 1 FROM filter_log f
+                WHERE f.pmid = a.pmid AND f.stage = 'hard_filter'
+            )
+        """).fetchall()
+
+    if not rows:
+        logger.info("无新增 PMID 需要硬过滤")
+        return {"total": 0, "filtered": 0, "passed": 0, "reason_counts": {}}
+
+    logger.info(f"增量硬过滤: 待处理 {len(rows)} 篇新文献")
+
+    # 先全量检测重复标题（需对比旧文献）
+    with get_conn(db_path) as conn:
+        dup_pmids = find_duplicate_titles(db_path, conn=conn)
+    logger.info(f"全量重复标题检测: 共 {len(dup_pmids)} 篇重复")
+
+    # 仅保留新增 PMID 中的重复项
+    new_pmids = {row["pmid"] for row in rows}
+    new_dup_pmids = dup_pmids & new_pmids
+    logger.info(f"其中新增 PMID 重复: {len(new_dup_pmids)} 篇")
+
+    reason_counts: dict[str, int] = {}
+    filtered_pmids: set[str] = set()
+    log_rows: list[tuple] = []
+    now = now_iso()
+
+    for row in rows:
+        pmid = row["pmid"]
+
+        if pmid in new_dup_pmids:
+            reason = "duplicate_title"
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            filtered_pmids.add(pmid)
+            log_rows.append((pmid, reason, now))
+            continue
+
+        for rule_fn in RULE_FUNCS:
+            reason = rule_fn(row)
+            if reason:
+                reason_key = reason.split("(")[0]
+                reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
+                filtered_pmids.add(pmid)
+                log_rows.append((pmid, reason, now))
+                break
+
+    # 批量写入过滤日志（追加模式，不删除旧记录）
+    if log_rows:
+        with get_conn(db_path) as conn:
+            conn.executemany(INSERT_LOG_SQL, log_rows)
+
+    passed = len(rows) - len(filtered_pmids)
+    logger.info(f"增量硬过滤完成：保留 {passed} 篇，过滤 {len(filtered_pmids)} 篇")
+    logger.info("过滤原因统计：")
+    for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+        logger.info(f"  {reason:<40} {cnt:>6} 篇")
+
+    return {
+        "total": len(rows),
+        "filtered": len(filtered_pmids),
+        "passed": passed,
+        "reason_counts": reason_counts,
+    }
+
+
+def mark_removed_pmids(db_path: Path, removed_pmids: set[str], reason: str = "query_removed"):
+    """
+    标记因查询词/年份变化而不再匹配的 PMID。
+    写入 filter_log，stage='query_removed'，不参与后续导出。
+    """
+    if not removed_pmids:
+        logger.info("无需标记移除的 PMID")
+        return
+
+    db_path = Path(db_path)
+    now = now_iso()
+    log_rows = [(pmid, reason, now) for pmid in removed_pmids]
+
+    with get_conn(db_path) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO filter_log (pmid, stage, reason, filtered_at) VALUES (?, ?, ?, ?)",
+            [(pmid, 'query_removed', reason, now) for pmid in removed_pmids]
+        )
+
+    logger.info(f"已标记 {len(removed_pmids)} 篇 PMID 为 '{reason}'")
