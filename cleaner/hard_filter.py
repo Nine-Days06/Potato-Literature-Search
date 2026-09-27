@@ -9,6 +9,11 @@
   4. 文章类型属于排除列表（Letter / Comment / Correction 等）
   5. 标题为空
   6. 疑似重复标题（同期刊同年份完全相同的标题）
+
+filter_log 记录约定（pmid 为主键，一篇文献至多一条）：
+  - stage='hard_filter'       被硬过滤排除，reason 为排除原因
+  - stage='hard_filter_pass'  通过硬过滤（含历史已验证文献回填）
+  - stage='query_removed'     因查询词/年份变更被移除
 """
 
 import sqlite3
@@ -31,6 +36,14 @@ INSERT_LOG_SQL = """
 INSERT OR REPLACE INTO filter_log (pmid, stage, reason, filtered_at)
 VALUES (?, 'hard_filter', ?, ?)
 """
+
+# 通过标记：硬过滤通过的 PMID 也写入 filter_log（stage='hard_filter_pass'），
+# 增量硬过滤据此识别"真正未处理过"的文献，避免每轮重复扫描全部历史文献
+INSERT_PASS_SQL = """
+INSERT OR REPLACE INTO filter_log (pmid, stage, reason, filtered_at)
+VALUES (?, 'hard_filter_pass', ?, ?)
+"""
+PASS_STAGE = "hard_filter_pass"
 
 
 # ── 单条规则函数 ──────────────────────────────────────────────
@@ -142,11 +155,15 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
 
         reason_counts: dict[str, int] = {}
         filtered_pmids: set[str] = set()
+        seen_pmids: set[str] = set()
         log_rows: list[tuple] = []
 
-        # 清理旧的过滤日志（仅限当前阶段）
-        conn.execute("DELETE FROM filter_log WHERE stage = 'hard_filter'")
-        
+        # 清理旧的过滤/通过标记（仅限硬过滤阶段，query_removed 等其他标记保留）
+        conn.execute(
+            "DELETE FROM filter_log WHERE stage IN ('hard_filter', ?)",
+            (PASS_STAGE,),
+        )
+
         # 分批读取（避免全量加载到内存）
         page_size = 5000
         offset    = 0
@@ -162,6 +179,7 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
 
             for row in rows:
                 pmid = row["pmid"]
+                seen_pmids.add(pmid)
 
                 if pmid in dup_pmids:
                     reason = "duplicate_title"
@@ -185,6 +203,13 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
 
         # 批量写入过滤日志
         conn.executemany(INSERT_LOG_SQL, log_rows)
+
+        # 通过的文献写入通过标记，供增量硬过滤识别已处理
+        pass_rows = [
+            (pmid, "passed", now)
+            for pmid in seen_pmids - filtered_pmids
+        ]
+        conn.executemany(INSERT_PASS_SQL, pass_rows)
 
     passed = total - len(filtered_pmids)
     logger.info(f"硬过滤完成：保留 {passed} 篇，过滤 {len(filtered_pmids)} 篇")
@@ -224,8 +249,14 @@ def get_passed_pmids(db_path: Path = DB_PATH, conn: sqlite3.Connection = None) -
 
 def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
     """
-    增量硬过滤：仅对未做过硬过滤的 PMID 执行过滤。
+    增量硬过滤：仅对"从未处理过"的 PMID 执行过滤。
     不清空 filter_log，只处理增量部分。
+
+    新文献判定（修复后的检测逻辑）：
+      1. filter_log 中无任何记录（任何 stage 均视为已处理/已移除）
+      2. 且未经过 LLM 验证（llm_validation 中不存在）
+    历史上已通过硬过滤并完成 LLM 验证的文献会回填 hard_filter_pass 标记
+    （reason='backfilled_validated'），此后不再重复扫描。
     重复标题检测仍需全量扫描（涉及旧文献），但只标记新 PMID。
     """
     db_path = Path(db_path)
@@ -233,19 +264,38 @@ def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
     logger.info("阶段三-A：增量硬过滤")
     logger.info("=" * 60)
 
+    now = now_iso()
+
+    # 回填：已通过 LLM 验证的文献必然通过过硬过滤（验证查询排除了被过滤项），
+    # 为其补写通过标记，使"新文献"检测只留下真正未处理的 PMID
     with get_conn(db_path) as conn:
-        # 找出 articles 中没有 hard_filter 日志的 PMID
+        backfilled = conn.execute("""
+            INSERT INTO filter_log (pmid, stage, reason, filtered_at)
+            SELECT v.pmid, ?, 'backfilled_validated', ?
+            FROM llm_validation v
+            WHERE NOT EXISTS (
+                SELECT 1 FROM filter_log f WHERE f.pmid = v.pmid
+            )
+        """, (PASS_STAGE, now)).rowcount
+    if backfilled:
+        logger.info(f"回填历史已验证文献 {backfilled} 篇（标记为 {PASS_STAGE}）")
+
+    # 找出真正未处理的 PMID：filter_log 无任何记录且未经过 LLM 验证
+    with get_conn(db_path) as conn:
         rows = conn.execute("""
             SELECT * FROM articles a
             WHERE NOT EXISTS (
-                SELECT 1 FROM filter_log f
-                WHERE f.pmid = a.pmid AND f.stage = 'hard_filter'
+                SELECT 1 FROM filter_log f WHERE f.pmid = a.pmid
             )
+            AND a.pmid NOT IN (SELECT pmid FROM llm_validation)
         """).fetchall()
 
     if not rows:
         logger.info("无新增 PMID 需要硬过滤")
-        return {"total": 0, "filtered": 0, "passed": 0, "reason_counts": {}}
+        return {
+            "total": 0, "filtered": 0, "passed": 0,
+            "reason_counts": {}, "backfilled": backfilled,
+        }
 
     logger.info(f"增量硬过滤: 待处理 {len(rows)} 篇新文献")
 
@@ -262,7 +312,6 @@ def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
     reason_counts: dict[str, int] = {}
     filtered_pmids: set[str] = set()
     log_rows: list[tuple] = []
-    now = now_iso()
 
     for row in rows:
         pmid = row["pmid"]
@@ -284,9 +333,14 @@ def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
                 break
 
     # 批量写入过滤日志（追加模式，不删除旧记录）
-    if log_rows:
+    # 通过的文献写入通过标记，下次增量运行不再重复处理
+    pass_rows = [(pmid, "passed", now) for pmid in new_pmids - filtered_pmids]
+    if log_rows or pass_rows:
         with get_conn(db_path) as conn:
-            conn.executemany(INSERT_LOG_SQL, log_rows)
+            if log_rows:
+                conn.executemany(INSERT_LOG_SQL, log_rows)
+            if pass_rows:
+                conn.executemany(INSERT_PASS_SQL, pass_rows)
 
     passed = len(rows) - len(filtered_pmids)
     logger.info(f"增量硬过滤完成：保留 {passed} 篇，过滤 {len(filtered_pmids)} 篇")
@@ -299,6 +353,7 @@ def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
         "filtered": len(filtered_pmids),
         "passed": passed,
         "reason_counts": reason_counts,
+        "backfilled": backfilled,
     }
 
 

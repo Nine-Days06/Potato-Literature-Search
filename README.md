@@ -231,7 +231,7 @@ python scripts/incremental_update.py --mark-removed
 |------|----------|
 | **下载** | 对比 `pmid_list.json`，仅下载 `新查询词结果 - 旧结果` 的差集 PMID |
 | **解析** | `INSERT OR IGNORE` 自动去重，无需额外处理 |
-| **硬过滤** | 仅扫描 `filter_log` 中无记录的新 PMID，重复标题全量对比但只标记新增 |
+| **硬过滤** | 仅处理 `filter_log` 中无任何记录的真正新增 PMID；通过者写入 `stage='hard_filter_pass'` 标记，历史已验证文献自动回填，重复标题全量对比但只标记新增 |
 | **LLM 验证** | 原生跳过已验证/已过滤 PMID，自动增量 |
 | **导出** | 按 `validated_at` 时间戳筛选，文件名含 `incremental` 标识 |
 

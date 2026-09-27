@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS articles (
 CREATE_FILTER_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS filter_log (
     pmid          TEXT PRIMARY KEY,
-    stage         TEXT,       -- 'hard_filter' / 'relevance'
+    stage         TEXT,       -- 'hard_filter'(排除) / 'hard_filter_pass'(通过) / 'query_removed'(查询词移除) / 'relevance'
     reason        TEXT,       -- 被过滤的原因
     filtered_at   TEXT        -- ISO 时间戳
 );
@@ -52,11 +52,16 @@ def init_db(db_path: Path) -> None:
     """初始化数据库，创建所有表"""
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
+    # 注意：sqlite3 连接作为上下文管理器只管理事务、不关闭连接，
+    # 必须显式 close，否则 Windows 上文件句柄滞留导致删除/移动失败
+    conn = sqlite3.connect(db_path)
+    try:
         conn.execute(CREATE_ARTICLES_SQL)
         conn.execute(CREATE_FILTER_LOG_SQL)
         conn.execute(CREATE_LLM_VALIDATION_SQL)
         conn.commit()
+    finally:
+        conn.close()
 
 
 @contextmanager
