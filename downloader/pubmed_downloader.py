@@ -76,6 +76,25 @@ def _get(url: str, params: dict, retries: int = 5) -> requests.Response:
             time.sleep(2 ** attempt)
 
 
+def _post(url: str, params: dict, retries: int = 5) -> requests.Response:
+    """带重试的 POST 请求（避免 URL 过长 414 错误）"""
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(url, data=params, timeout=60)
+            if r.status_code == 429:
+                wait = 2 ** attempt
+                logger.warning(f"Rate limited, waiting {wait}s (attempt {attempt})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r
+        except requests.RequestException as e:
+            if attempt == retries:
+                raise
+            logger.warning(f"Request failed ({e}), retrying {attempt}/{retries}")
+            time.sleep(2 ** attempt)
+
+
 def _safe_json(r: requests.Response) -> dict:
     """处理 NCBI 可能返回的带非法控制字符的 JSON"""
     try:
@@ -131,7 +150,8 @@ def fetch_pmid_list(query: str = PUBMED_QUERY,
         "rettype": "json",
         "retmode": "json",
     }
-    r = _get(f"{EUTILS_BASE}/esearch.fcgi", params)
+    # 使用 POST 避免查询词过长导致 414 URI Too Long
+    r = _post(f"{EUTILS_BASE}/esearch.fcgi", params)
     result = _safe_json(r)["esearchresult"]
     
     if "ERROR" in result:
