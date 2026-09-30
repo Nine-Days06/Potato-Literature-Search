@@ -14,6 +14,9 @@ from cleaner.llm_validator import (
     _count_verdicts,
     _normalize_verdict,
     _export_raw_csv,
+    _export_filtered_csv,
+    export_incremental_raw_csv,
+    RAW_EXPORT_FIELDS,
 )
 from utils.db import init_db, get_conn
 
@@ -484,6 +487,143 @@ class TestExportRawCsv(unittest.TestCase):
             conn.execute("DELETE FROM llm_validation")
         path = self._export()
         self.assertIsNone(path)
+
+
+class TestIncrementalRawCsv(unittest.TestCase):
+    """
+    特征化测试（D3 重构前置）：钉住 export_incremental_raw_csv 的既有行为。
+
+    三个易被"顺手优化"破坏的契约：
+    1. 文件名后缀 ``_since_{since.replace(':', '-').replace('T', '_')}``；
+    2. 时间谓词是严格 ``>``（等于 since 的行必须排除）；
+    3. ORDER BY v.validated_at 与 since_timestamp **无关**，无 since 时依然排序。
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "test.db"
+        init_db(self.db_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _seed(self, validations):
+        """validations: [(pmid, validated_at, llm_verdict, human_review), ...]"""
+        with get_conn(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO articles "
+                "(pmid, title, abstract, pub_year, pub_month, journal, "
+                "pmc_id, raw_xml_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (pmid, f"Title {pmid}", f"Abstract {pmid}",
+                     "2026", "Jan", "Plant J", f"PMC{pmid}", "batch1.xml")
+                    for pmid, *_ in validations
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO llm_validation "
+                "(pmid, llm_verdict, reason, validated_at, human_review) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (pmid, verdict, f"reason {pmid}", validated_at, review)
+                    for pmid, validated_at, verdict, review in validations
+                ],
+            )
+
+    def _export(self, since):
+        import cleaner.llm_validator as mod
+        orig = mod.OUTPUT_DIR
+        mod.OUTPUT_DIR = self.temp_dir
+        try:
+            return mod.export_incremental_raw_csv(since, db_path=self.db_path)
+        finally:
+            mod.OUTPUT_DIR = orig
+
+    def _read(self, path):
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            return reader.fieldnames, list(reader)
+
+    def test_incremental_export_filters_by_validated_at_and_orders_ascending(self):
+        # 严格递增的 validated_at，但按 DESC 顺序插入 —— 若无 ORDER BY，
+        # 结果会是插入顺序（倒序），测试即可捕捉到顺序回归。
+        self._seed([
+            ("1", "2026-03-01T00:00:00", "RELEVANT", "Y"),
+            ("2", "2026-02-01T00:00:00", "RELEVANT", "Y"),
+            ("3", "2026-01-01T00:00:00", "RELEVANT", "Y"),
+        ])
+        path = self._export("2026-01-15T00:00:00")
+        self.assertIsNotNone(path)
+
+        # (a) 文件名后缀变换契约
+        self.assertTrue(
+            path.name.startswith("articles_raw_incremental_since_2026-01-15_00-00-00_"),
+            path.name,
+        )
+
+        fieldnames, rows = self._read(path)
+        # (b) 仅 validated_at > since 的 2 行；2026-01-01 必须被排除
+        self.assertEqual([r["pmid"] for r in rows], ["2", "1"])
+        self.assertNotIn("3", [r["pmid"] for r in rows])
+        # (c) 升序
+        self.assertEqual([r["pmid"] for r in rows], ["2", "1"])
+        # (d) 表头 == RAW_EXPORT_FIELDS
+        self.assertEqual(fieldnames, RAW_EXPORT_FIELDS)
+
+    def test_incremental_export_boundary_row_at_since_is_excluded(self):
+        """谓词是严格 `>`：validated_at 恰等于 since 的行不得导出"""
+        self._seed([
+            ("1", "2026-01-15T00:00:00", "RELEVANT", "Y"),
+        ])
+        path = self._export("2026-01-15T00:00:00")
+        self.assertIsNone(path, "validated_at == since 应被排除，因此无数据可导出")
+
+    def test_incremental_export_without_since_has_no_filename_suffix_but_still_orders(self):
+        """since=None：无 `_since_` 后缀、导出全部、**仍然**按 validated_at 升序"""
+        self._seed([
+            ("1", "2026-03-01T00:00:00", "RELEVANT", "Y"),
+            ("2", "2026-02-01T00:00:00", "RELEVANT", "Y"),
+            ("3", "2026-01-01T00:00:00", "RELEVANT", "Y"),
+        ])
+        path = self._export(None)
+        self.assertIsNotNone(path)
+        self.assertNotIn("_since_", path.name, path.name)
+
+        _, rows = self._read(path)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([r["pmid"] for r in rows], ["3", "2", "1"])
+
+    def test_filtered_export_uses_its_own_column_set(self):
+        """_export_filtered_csv 的列集/筛选与 raw 导出不同，勿混用"""
+        import cleaner.llm_validator as mod
+        self._seed([
+            ("1", "2026-03-01T00:00:00", "NOT_RELEVANT", "Y"),       # 人工通过 → 导出
+            ("2", "2026-02-01T00:00:00", "RELEVANT", None),            # LLM 相关未复核 → 导出
+            ("3", "2026-01-01T00:00:00", "RELEVANT", "N"),             # 人工驳回 → 不导出
+            ("4", "2025-12-01T00:00:00", "NOT_RELEVANT", None),        # LLM 不相关 → 不导出
+        ])
+
+        orig_db, orig_out = mod.DB_PATH, mod.OUTPUT_DIR
+        mod.DB_PATH, mod.OUTPUT_DIR = self.db_path, self.temp_dir
+        try:
+            path = mod._export_filtered_csv()
+        finally:
+            mod.DB_PATH, mod.OUTPUT_DIR = orig_db, orig_out
+
+        self.assertIsNotNone(path)
+        self.assertTrue(path.name.startswith("llm_filtered_"), path.name)
+
+        fieldnames, rows = self._read(path)
+        self.assertEqual(sorted(r["pmid"] for r in rows), ["1", "2"])
+        self.assertEqual(fieldnames[-3:], ["llm_verdict", "llm_reason", "human_review"])
+        self.assertNotIn("reason", fieldnames)
+        # 过滤导出不含 raw 专属列
+        for col in ("pub_month", "journal_abbr"):
+            self.assertNotIn(col, fieldnames)
+        # reason → llm_reason 改名生效
+        by_pmid = {r["pmid"]: r for r in rows}
+        self.assertEqual(by_pmid["1"]["llm_reason"], "reason 1")
 
 
 if __name__ == "__main__":

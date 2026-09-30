@@ -132,6 +132,38 @@ def find_duplicate_titles(db_path: Path = DB_PATH, conn: sqlite3.Connection = No
     return duplicates
 
 
+# ── 单行判定与统计输出（全量 / 增量共用）─────────────────────
+
+def _evaluate_row(row, dup_pmids, reason_counts, filtered_pmids, log_rows, now) -> None:
+    """单行硬过滤判定：重复标题优先，其后 RULE_FUNCS 任一命中即停。
+
+    直接累加 reason_counts（按 '(' 前缀归一）、filtered_pmids、log_rows。
+    """
+    pmid = row["pmid"]
+    if pmid in dup_pmids:
+        reason = "duplicate_title"
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        filtered_pmids.add(pmid)
+        log_rows.append((pmid, reason, now))
+        return
+
+    for rule_fn in RULE_FUNCS:
+        reason = rule_fn(row)
+        if reason:
+            reason_key = reason.split("(")[0]
+            reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
+            filtered_pmids.add(pmid)
+            log_rows.append((pmid, reason, now))
+            break
+
+
+def _log_reason_stats(reason_counts: dict) -> None:
+    """输出过滤原因统计（两个入口共用）"""
+    logger.info("过滤原因统计：")
+    for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+        logger.info(f"  {reason:<40} {cnt:>6} 篇")
+
+
 # ── 主流程 ────────────────────────────────────────────────────
 
 def run_hard_filter(db_path: Path = DB_PATH) -> dict:
@@ -178,24 +210,8 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
                 break
 
             for row in rows:
-                pmid = row["pmid"]
-                seen_pmids.add(pmid)
-
-                if pmid in dup_pmids:
-                    reason = "duplicate_title"
-                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
-                    filtered_pmids.add(pmid)
-                    log_rows.append((pmid, reason, now))
-                    continue
-
-                for rule_fn in RULE_FUNCS:
-                    reason = rule_fn(row)
-                    if reason:
-                        reason_key = reason.split("(")[0]
-                        reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
-                        filtered_pmids.add(pmid)
-                        log_rows.append((pmid, reason, now))
-                        break
+                seen_pmids.add(row["pmid"])
+                _evaluate_row(row, dup_pmids, reason_counts, filtered_pmids, log_rows, now)
 
             offset += page_size
             if offset % 20000 == 0:
@@ -213,9 +229,7 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
 
     passed = total - len(filtered_pmids)
     logger.info(f"硬过滤完成：保留 {passed} 篇，过滤 {len(filtered_pmids)} 篇")
-    logger.info("过滤原因统计：")
-    for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
-        logger.info(f"  {reason:<40} {cnt:>6} 篇")
+    _log_reason_stats(reason_counts)
 
     return {
         "total": total,
@@ -223,26 +237,6 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
         "passed": passed,
         "reason_counts": reason_counts,
     }
-
-
-def get_passed_pmids(db_path: Path = DB_PATH, conn: sqlite3.Connection = None) -> list[str]:
-    """
-    返回通过硬过滤的 PMID 列表
-    （即 articles 表中不在 filter_log 里的记录）
-    """
-    query = """
-        SELECT pmid FROM articles a
-        WHERE NOT EXISTS (
-            SELECT 1 FROM filter_log f
-            WHERE f.pmid = a.pmid AND f.stage = 'hard_filter'
-        )
-    """
-    if conn is not None:
-        rows = conn.execute(query).fetchall()
-    else:
-        with get_conn(db_path) as c:
-            rows = c.execute(query).fetchall()
-    return [r["pmid"] for r in rows]
 
 
 # ── 增量硬过滤 ────────────────────────────────────────────────
@@ -314,23 +308,7 @@ def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
     log_rows: list[tuple] = []
 
     for row in rows:
-        pmid = row["pmid"]
-
-        if pmid in new_dup_pmids:
-            reason = "duplicate_title"
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
-            filtered_pmids.add(pmid)
-            log_rows.append((pmid, reason, now))
-            continue
-
-        for rule_fn in RULE_FUNCS:
-            reason = rule_fn(row)
-            if reason:
-                reason_key = reason.split("(")[0]
-                reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
-                filtered_pmids.add(pmid)
-                log_rows.append((pmid, reason, now))
-                break
+        _evaluate_row(row, new_dup_pmids, reason_counts, filtered_pmids, log_rows, now)
 
     # 批量写入过滤日志（追加模式，不删除旧记录）
     # 通过的文献写入通过标记，下次增量运行不再重复处理
@@ -344,9 +322,7 @@ def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
 
     passed = len(rows) - len(filtered_pmids)
     logger.info(f"增量硬过滤完成：保留 {passed} 篇，过滤 {len(filtered_pmids)} 篇")
-    logger.info("过滤原因统计：")
-    for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
-        logger.info(f"  {reason:<40} {cnt:>6} 篇")
+    _log_reason_stats(reason_counts)
 
     return {
         "total": len(rows),
@@ -368,7 +344,6 @@ def mark_removed_pmids(db_path: Path, removed_pmids: set[str], reason: str = "qu
 
     db_path = Path(db_path)
     now = now_iso()
-    log_rows = [(pmid, reason, now) for pmid in removed_pmids]
 
     with get_conn(db_path) as conn:
         conn.executemany(

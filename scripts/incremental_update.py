@@ -200,17 +200,15 @@ def main():
         logger.info("跳过 LLM 验证阶段（使用 --validate 启用）")
 
     # 6. 增量导出（--export 或 --export-since 显式启用，对齐 main.py --step export）
-    if args.export_since:
-        logger.info(f"开始增量导出 (since={args.export_since})...")
-        path = export_incremental_raw_csv(args.export_since)
-        if path:
-            logger.info(f"增量导出完成: {path}")
+    if args.export_since or args.export:
+        if args.export_since:
+            logger.info(f"开始增量导出 (since={args.export_since})...")
+            since = args.export_since
         else:
-            logger.info("增量导出: 无新增数据")
-    elif args.export:
-        # --export：导出本次运行开始时间后新增的复核通过文献
-        logger.info("开始增量导出（本次运行新增）...")
-        path = export_incremental_raw_csv(start_time)
+            # --export：导出本次运行开始时间后新增的复核通过文献
+            logger.info("开始增量导出（本次运行新增）...")
+            since = start_time
+        path = export_incremental_raw_csv(since)
         if path:
             logger.info(f"增量导出完成: {path}")
         else:

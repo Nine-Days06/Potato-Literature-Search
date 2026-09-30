@@ -14,7 +14,6 @@ import json
 import threading
 import requests
 from pathlib import Path
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import (
@@ -24,7 +23,6 @@ from config.settings import (
     SEARCH_YEAR_MIN, SEARCH_YEAR_MAX, SEARCH_SLICE_YEARS,
 )
 from utils.logger import get_logger
-from utils import db as dbutil
 
 logger = get_logger("downloader")
 
@@ -57,11 +55,14 @@ def _base_params() -> dict:
     return p
 
 
-def _get(url: str, params: dict, retries: int = 5) -> requests.Response:
-    """带重试的 GET 请求（处理 429 / 5xx）"""
+def _request_with_retry(send, url: str, params: dict, retries: int = 5) -> requests.Response:
+    """带重试的 HTTP 请求（处理 429 / 5xx）
+
+    send: 接收 (url, params) 并返回 Response 的可调用对象
+    """
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(url, params=params, timeout=60)
+            r = send(url, params)
             if r.status_code == 429:
                 wait = 2 ** attempt
                 logger.warning(f"Rate limited, waiting {wait}s (attempt {attempt})")
@@ -74,25 +75,20 @@ def _get(url: str, params: dict, retries: int = 5) -> requests.Response:
                 raise
             logger.warning(f"Request failed ({e}), retrying {attempt}/{retries}")
             time.sleep(2 ** attempt)
+
+
+def _get(url: str, params: dict, retries: int = 5) -> requests.Response:
+    """带重试的 GET 请求（处理 429 / 5xx）"""
+    return _request_with_retry(
+        lambda u, p: requests.get(u, params=p, timeout=60), url, params, retries
+    )
 
 
 def _post(url: str, params: dict, retries: int = 5) -> requests.Response:
     """带重试的 POST 请求（避免 URL 过长 414 错误）"""
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.post(url, data=params, timeout=60)
-            if r.status_code == 429:
-                wait = 2 ** attempt
-                logger.warning(f"Rate limited, waiting {wait}s (attempt {attempt})")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r
-        except requests.RequestException as e:
-            if attempt == retries:
-                raise
-            logger.warning(f"Request failed ({e}), retrying {attempt}/{retries}")
-            time.sleep(2 ** attempt)
+    return _request_with_retry(
+        lambda u, p: requests.post(u, data=p, timeout=60), url, params, retries
+    )
 
 
 def _safe_json(r: requests.Response) -> dict:

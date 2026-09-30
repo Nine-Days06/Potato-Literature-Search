@@ -759,6 +759,18 @@ def _run_sync_validation_for_pmids(pmid_list: list):
     rows_list = [dict(r) for r in rows]
     remaining_rows = rows_list
     all_validated = []
+    # ─────────────────────────────────────────────────────────────────
+    # 注意：本轮循环与 _run_sync_validation() 的轮循环"刻意不同"，请勿直接合并：
+    #   1. 不读写 llm_validation 检查点文件——若此处也写检查点，会覆盖主流程
+    #      （--step validate）的断点状态，导致下次恢复时 start_round 错误，
+    #      静默跳过或重复计费一批文献；
+    #   2. 轮内不打任何日志、异常静默丢弃——batch 降级重试需保持零输出，
+    #      改动会破坏该路径的日志契约，使真实失败被噪音淹没；
+    #   3. 行来自调用方给定的 PMID 列表，且已转为 dict（主流程是 sqlite3.Row）。
+    # 若确需去重，先补齐特征化测试（降级静默 / 降级重试 / 主流程日志序列 /
+    # 主流程失败 / 检查点恢复共 5 例）确认日志序列可确定性断言，再抽取
+    # _run_sync_round(remaining_rows, *, log_progress: bool) 一类的公共块。
+    # ─────────────────────────────────────────────────────────────────
     for round_num in range(1, LLM_MAX_ROUNDS + 2):
         if not remaining_rows:
             break
@@ -1278,13 +1290,10 @@ def _finalize_batch(chk: dict):
         """).fetchall()
 
     logger.info("LLM 验证统计（Batch）:")
-    log_info = []
     total = 0
     for v, cnt in verdicts:
         total += cnt
-        log_info.append((v, cnt))
-    logger.info("LLM 验证统计（Batch）:")
-    for v, cnt in log_info:
+    for v, cnt in verdicts:
         logger.info(f"  {v}: {cnt} 篇 ({cnt / total * 100:.1f}%)")
 
     csv_path_file = _export_review_csv()
@@ -1351,18 +1360,26 @@ def import_human_review(csv_path: str | None = None):
     return {"passed": passed, "rejected": rejected, "skipped": skipped}
 
 
+# 复核通过谓词：human_review='Y' 或（未复核且 llm_verdict='RELEVANT'）。
+# **必须保留外层括号**：增量路径会在其后追加 "AND v.validated_at > ?"，
+# 若去掉括号 SQL 会解析成 "A OR (B AND C)"，人工通过的行每次增量都会被重复导出。
+_REVIEW_PASS_PREDICATE = (
+    "(v.human_review = 'Y'\n"
+    "               OR (v.human_review IS NULL AND v.llm_verdict = 'RELEVANT'))"
+)
+
+
 def _export_filtered_csv() -> Path | None:
     """导出 LLM 验证 + 人工复核后的最终结果"""
     with get_conn(DB_PATH) as conn:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT a.pmid, a.title, a.abstract, a.keywords, a.mesh_terms,
                    a.pub_year, a.journal, a.doi, a.pmc_id,
                    a.article_types, a.authors, a.affiliation, a.language,
                    v.llm_verdict, v.reason, v.human_review
             FROM articles a
             JOIN llm_validation v ON a.pmid = v.pmid
-            WHERE v.human_review = 'Y'
-               OR (v.human_review IS NULL AND v.llm_verdict = 'RELEVANT')
+            WHERE {_REVIEW_PASS_PREDICATE}
         """).fetchall()
 
     if not rows:
@@ -1381,13 +1398,8 @@ def _export_filtered_csv() -> Path | None:
         "llm_verdict", "llm_reason", "human_review",
     ]
 
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            d = dict(row)
-            d["llm_reason"] = d.pop("reason", "")
-            writer.writerow(d)
+    _write_dict_csv(csv_path, fieldnames, rows,
+                    transform=_rename_reason_to_llm_reason)
 
     logger.info(f"最终过滤结果: {csv_path} ({len(rows)} 篇)")
     return csv_path
@@ -1401,23 +1413,56 @@ RAW_EXPORT_FIELDS = [
 ]
 
 
-def _export_raw_csv(db_path: Path = DB_PATH) -> Path | None:
+def _query_raw_export(db_path: Path, since_timestamp: str | None = None,
+                      *, order_by_validated_at: bool = False) -> list:
+    """raw 导出共用查询：列清单与复核谓词单一来源。
+
+    order_by_validated_at 仅增量路径启用（全量路径保持无 ORDER BY 的现状）。
     """
-    导出复核通过文献的原始信息 CSV（articles 表原始字段，不含 raw_xml_file、LLM/复核列）。
-    筛选条件与 _export_filtered_csv 一致：
-    human_review='Y' 或（未复核且 llm_verdict='RELEVANT'）。
-    """
-    with get_conn(db_path) as conn:
-        rows = conn.execute("""
+    sql = f"""
             SELECT a.pmid, a.title, a.abstract, a.keywords, a.mesh_terms,
                    a.pub_year, a.pub_month, a.journal, a.journal_abbr, a.doi,
                    a.pmc_id, a.article_types, a.authors, a.affiliation,
                    a.language
             FROM articles a
             JOIN llm_validation v ON a.pmid = v.pmid
-            WHERE v.human_review = 'Y'
-               OR (v.human_review IS NULL AND v.llm_verdict = 'RELEVANT')
-        """).fetchall()
+            WHERE {_REVIEW_PASS_PREDICATE}
+        """
+    params: list = []
+    if since_timestamp:
+        sql += "\n              AND v.validated_at > ?"
+        params.append(since_timestamp)
+    if order_by_validated_at:
+        sql += "\n            ORDER BY v.validated_at"
+    with get_conn(db_path) as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def _write_dict_csv(csv_path: Path, fieldnames: list, rows, transform=None) -> None:
+    """以 utf-8-sig 写 CSV（DictWriter + 可选行变换）"""
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            d = dict(row)
+            if transform is not None:
+                d = transform(d)
+            writer.writerow(d)
+
+
+def _rename_reason_to_llm_reason(d: dict) -> dict:
+    """最终过滤导出：reason 列改名为 llm_reason"""
+    d["llm_reason"] = d.pop("reason", "")
+    return d
+
+
+def _export_raw_csv(db_path: Path = DB_PATH) -> Path | None:
+    """
+    导出复核通过文献的原始信息 CSV（articles 表原始字段，不含 raw_xml_file、LLM/复核列）。
+    筛选条件与 _export_filtered_csv 一致：
+    human_review='Y' 或（未复核且 llm_verdict='RELEVANT'）。
+    """
+    rows = _query_raw_export(db_path)
 
     if not rows:
         logger.info("没有符合条件的原始文献记录")
@@ -1428,11 +1473,7 @@ def _export_raw_csv(db_path: Path = DB_PATH) -> Path | None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"articles_raw_{ts}.csv"
 
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=RAW_EXPORT_FIELDS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(dict(row))
+    _write_dict_csv(csv_path, RAW_EXPORT_FIELDS, rows)
 
     logger.info(f"原始文献信息已导出: {csv_path} ({len(rows)} 篇)")
     return csv_path
@@ -1441,53 +1482,29 @@ def _export_raw_csv(db_path: Path = DB_PATH) -> Path | None:
 def export_incremental_raw_csv(since_timestamp: str = None, db_path: Path = DB_PATH) -> Path | None:
     """
     增量导出：导出指定时间后新增的、复核通过的文献原始信息。
-    
+
     Args:
         since_timestamp: ISO 格式时间字符串，如 '2025-08-01T00:00:00'。
                          仅导出 validated_at > since_timestamp 的记录。
                          None 则导出所有（等同于 _export_raw_csv）。
         db_path: 数据库路径
-    
+
     Returns:
         导出的 CSV 文件路径，无数据则返回 None
     """
-    where_clause = ""
-    params = []
-    if since_timestamp:
-        where_clause = "AND v.validated_at > ?"
-        params.append(since_timestamp)
-    
-    query = f"""
-        SELECT a.pmid, a.title, a.abstract, a.keywords, a.mesh_terms,
-               a.pub_year, a.pub_month, a.journal, a.journal_abbr, a.doi,
-               a.pmc_id, a.article_types, a.authors, a.affiliation,
-               a.language
-        FROM articles a
-        JOIN llm_validation v ON a.pmid = v.pmid
-        WHERE (v.human_review = 'Y'
-            OR (v.human_review IS NULL AND v.llm_verdict = 'RELEVANT'))
-          {where_clause}
-        ORDER BY v.validated_at
-    """
-    
-    with get_conn(db_path) as conn:
-        rows = conn.execute(query, params).fetchall()
-    
+    rows = _query_raw_export(db_path, since_timestamp, order_by_validated_at=True)
+
     if not rows:
         logger.info(f"增量导出: 无新增符合条件的记录 (since={since_timestamp})")
         return None
-    
+
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = f"_since_{since_timestamp.replace(':', '-').replace('T', '_')}" if since_timestamp else ""
     csv_path = out_dir / f"articles_raw_incremental{suffix}_{ts}.csv"
-    
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=RAW_EXPORT_FIELDS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(dict(row))
-    
+
+    _write_dict_csv(csv_path, RAW_EXPORT_FIELDS, rows)
+
     logger.info(f"增量导出原始文献信息: {csv_path} ({len(rows)} 篇, since={since_timestamp})")
     return csv_path
