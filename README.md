@@ -173,12 +173,13 @@ python main.py --query "potato AND drought AND gene"
 | `--query` | download / all | 自定义 PubMed 搜索词 |
 | `--xml-dir` | parse / all | XML 文件目录（默认 `data/raw_xml/`） |
 | `--csv` | import-review | 人工复核 CSV 文件路径（默认自动查找最新文件） |
+| `--skip-filter` | 增量更新 | 跳过硬过滤阶段（仅 `scripts/incremental_update.py`） |
 
 ## 输出文件
 
 | 文件 | 说明 |
 |------|------|
-| `data/processed/potato_lit.db` | 全量结构化文献库（articles + filter_log + llm_validation + batch_checkpoints 四张表） |
+| `data/processed/potato_lit.db` | 全量结构化文献库（articles + filter_log + llm_validation 三张表） |
 | `data/output/llm_review_pending_*.csv` | LLM 验证待人工复核清单（标注 Y/N） |
 | `data/output/llm_validation_failed_*.csv` | LLM 校验失败 PMID 清单 |
 | `data/output/llm_filtered_*.csv` | LLM + 人工复核后的最终过滤结果 |
@@ -203,7 +204,7 @@ python scripts/incremental_update.py
 # 2. 核心三步 + LLM 验证（对齐 main.py --step validate）
 python scripts/incremental_update.py --validate
 
-# 3. 核心三步 + 验证 + 导出（完整增量，对齐 main.py --step validate --step export）
+# 3. 核心三步 + 验证 + 导出（完整增量，对齐 main.py --step validate 与 main.py --step export）
 python scripts/incremental_update.py --validate --export
 
 # 4. 搜索词优化 + 年份扩大 + 完整增量
@@ -223,6 +224,9 @@ python scripts/incremental_update.py --export-since "2025-08-01T00:00:00"
 
 # 9. 标记因查询词变化不再匹配的旧 PMID（可选，软保留不删除）
 python scripts/incremental_update.py --mark-removed
+
+# 10. 设置新最大年份（扩大年份范围时配合 --year-min 使用）
+python scripts/incremental_update.py --year-max 2026
 ```
 
 ### 增量更新原理

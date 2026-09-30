@@ -123,7 +123,7 @@ def run_incremental_download(
     removed_pmids = old_pmids - new_pmids_set
     retained_pmids = old_pmids & new_pmids_set
     
-    logger.info(f"PMID 对比结果:")
+    logger.info("PMID 对比结果:")
     logger.info(f"  保留: {len(retained_pmids)} 篇")
     logger.info(f"  新增: {len(added_pmids)} 篇")
     logger.info(f"  移除: {len(removed_pmids)} 篇 (查询词/年份变化导致不再匹配)")
@@ -173,7 +173,6 @@ def get_removed_pmids(
 
 if __name__ == "__main__":
     # 简单测试
-    import sys
     from utils.db import init_db
     from config.settings import DB_PATH
     
@@ -181,4 +180,4 @@ if __name__ == "__main__":
     
     # 模拟：只跑增量下载，不改查询词
     files = run_incremental_download()
-    print(f"Downloaded {len(files)} batch files")
+    logger.info(f"Downloaded {len(files)} batch files")
