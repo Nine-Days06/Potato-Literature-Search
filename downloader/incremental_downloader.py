@@ -13,14 +13,14 @@ from pathlib import Path
 from typing import Optional, List
 
 from config.settings import (
-    RAW_XML_DIR, PUBMED_QUERY, SEARCH_YEAR_MIN, SEARCH_YEAR_MAX, SEARCH_SLICE_YEARS
+    RAW_XML_DIR, PUBMED_QUERY, SEARCH_YEAR_MIN, SEARCH_YEAR_MAX, SEARCH_SLICE_YEARS, LOG_DIR
 )
 from downloader.pubmed_downloader import (
     fetch_pmid_list, download_xml_batches, _generate_year_slices
 )
 from utils.logger import get_logger
 
-logger = get_logger("incremental_downloader")
+logger = get_logger("incremental_downloader", log_dir=LOG_DIR)
 
 
 def _load_old_pmid_list(pmid_file: Path) -> tuple[set[str], Optional[str]]:

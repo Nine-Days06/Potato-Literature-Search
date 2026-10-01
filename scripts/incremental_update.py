@@ -33,11 +33,11 @@ from downloader.incremental_downloader import run_incremental_download, get_remo
 from parser.xml_parser import run_parse
 from cleaner.hard_filter import run_incremental_hard_filter, mark_removed_pmids
 from cleaner.llm_validator import run_validation, export_incremental_raw_csv
-from config.settings import RAW_XML_DIR, DB_PATH
+from config.settings import RAW_XML_DIR, DB_PATH, LOG_DIR
 from utils.db import init_db
 from utils.logger import get_logger
 
-logger = get_logger("incremental_update")
+logger = get_logger("incremental_update", log_dir=LOG_DIR)
 
 
 def main():

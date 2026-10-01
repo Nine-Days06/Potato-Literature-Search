@@ -24,12 +24,13 @@ from config.settings import (
     ABSTRACT_MIN_LEN,
     PUB_YEAR_MIN, PUB_YEAR_MAX,
     EXCLUDED_ARTICLE_TYPES,
+    LOG_DIR,
 )
 from utils import now_iso
 from utils.db import get_conn
 from utils.logger import get_logger
 
-logger = get_logger("hard_filter")
+logger = get_logger("hard_filter", log_dir=LOG_DIR)
 
 # 写入过滤日志
 INSERT_LOG_SQL = """
