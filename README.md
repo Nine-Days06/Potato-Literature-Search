@@ -34,7 +34,7 @@ Potato-Literature-Search/
 ├── downloader/
 │   ├── __init__.py
 │   ├── pubmed_downloader.py     # NCBI E-utilities 批量下载 XML（并发 + 速率限制）
-│   └── pdf_downloader.py        # PMC OA 全文下载（PDF/TGZ），失败导出清单 + checkpoint 断点续传
+│   └── pdf_downloader.py        # PMC 全文下载（PDF/TXT），失败导出清单 + checkpoint 断点续传
 ├── parser/
 │   ├── __init__.py
 │   └── xml_parser.py            # XML 解析 → SQLite（复用单连接写入）
@@ -188,7 +188,7 @@ python main.py --query "potato AND drought AND gene"
 | `data/output/failed_downloads_*.csv` | PDF 下载失败链接清单（供 `--step pdf-retry` 续跑） |
 | `data/output/pdf_download_progress.json` | PDF 重试断点（中断后自动恢复） |
 | `data/output/oa_download_links_*.csv` | OA 资源下载链接清单 |
-| `data/pdfs/` | LLM 判定相关文献的 PDF 全文文件（tgz 包内无 PDF 时回退保存 `.txt` 文本全文） |
+| `data/pdfs/` | LLM 判定相关文献的 PDF 全文文件（无 PDF 时回退保存 `.txt` 文本全文） |
 | `logs/` | 各模块运行日志（按名称+日期分文件） |
 
 ---

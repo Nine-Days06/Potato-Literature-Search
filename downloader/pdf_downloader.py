@@ -22,13 +22,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import (
-    DB_PATH, PMC_OA_API, PDF_DIR,
-    REQUEST_INTERVAL, OUTPUT_DIR, PROXY
+    DB_PATH, PMC_S3_URL, PDF_DIR,
+    REQUEST_INTERVAL, OUTPUT_DIR, PROXY, LOG_DIR
 )
 from utils.db import get_conn
 from utils.logger import get_logger
 
-logger = get_logger("pdf_downloader")
+logger = get_logger("pdf_downloader", log_dir=LOG_DIR)
 
 MIN_VALID_FILE_BYTES = 1024
 
@@ -46,7 +46,9 @@ RETRY_CHECKPOINT_INTERVAL = 10
 def normalize_pmc_asset_url(url: str) -> str:
     """
     将 OA API 返回的资源链接标准化为当前可访问的 HTTPS 路径。
-
+    
+    注意：此函数仅用于标准化历史缓存的 URL。NCBI FTP 路径已于 2026-08 删除，
+    新的 PMC Cloud Service 使用直接的 S3 URL，无需标准化。
     背景：PMC 在 2026-04 调整了 FTP/Cloud 目录结构，旧路径
     /pub/pmc/... 需迁移到 /pub/pmc/deprecated/...。
     """
@@ -129,47 +131,158 @@ def _request_oa_with_retry(
     return None
 
 
+def _list_s3_versions(pmc_id: str) -> list[int]:
+    """
+    从 S3 列出指定 PMCID 的所有版本号。
+    返回排序后的版本号列表，空列表表示不存在或碰撞。
+    """
+    versions = []
+    token = None
+    page = 0
+    max_pages = 5  # 安全上限
+    
+    while page < max_pages:
+        params = {
+            "list-type": "2",
+            "prefix": f"{pmc_id}.",
+            "delimiter": "/",
+            "max-keys": "1000"
+        }
+        if token:
+            params["continuation-token"] = token
+        
+        kwargs = {"params": params, "timeout": 30}
+        if PROXY:
+            kwargs["proxies"] = {"http": PROXY, "https": PROXY}
+        
+        try:
+            r = requests.get(PMC_S3_URL, **kwargs)
+            r.raise_for_status()
+        except requests.RequestException:
+            # 网络异常，让调用者处理
+            raise
+        
+        # 解析 XML 响应
+        try:
+            root = etree.fromstring(r.content)
+            namespace = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+            
+            # 提取版本号
+            for prefix_elem in root.xpath("//s3:CommonPrefixes/s3:Prefix", namespaces=namespace):
+                prefix = prefix_elem.text
+                # 匹配 PMC123456.1/ 格式，防止 PMC5190450.1/ 这样的碰撞
+                match = re.match(re.escape(pmc_id) + r"\.(\d+)/$", prefix)
+                if match:
+                    versions.append(int(match.group(1)))
+            
+            # 检查是否有下一页
+            token_elem = root.xpath("//s3:NextContinuationToken", namespaces=namespace)
+            if token_elem:
+                token = token_elem[0].text
+                page += 1
+            else:
+                break
+        except Exception as e:
+            logger.warning(f"解析 S3 版本列表失败: {pmc_id} -> {e}")
+            break
+    
+    return sorted(versions)
+
+
+def _fetch_cloud_metadata(pmc_id: str, version: int) -> dict | None:
+    """
+    获取指定 PMCID 和版本的元数据 JSON。
+    返回 None 表示 404，其他异常抛出。
+    """
+    url = f"{PMC_S3_URL}/{pmc_id}.{version}/{pmc_id}.{version}.json"
+    
+    kwargs = {"timeout": 30}
+    if PROXY:
+        kwargs["proxies"] = {"http": PROXY, "https": PROXY}
+    
+    try:
+        r = requests.get(url, **kwargs)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError:
+        # 只有 404 返回 None，其他 HTTP 错误抛出
+        if r.status_code == 404:
+            return None
+        raise
+
+
+def _s3_uri_to_https(url: str) -> str:
+    """
+    将元数据 JSON 中的 `s3://pmc-oa-opendata/...` URI 转为匿名可访问的 HTTPS 直链。
+    aria2c 仅支持 http/https/ftp/bt，不识别 s3:// 协议；桶为公开匿名读，无需签名。
+    """
+    prefix = "s3://pmc-oa-opendata/"
+    if url.startswith(prefix):
+        return f"{PMC_S3_URL}/{url[len(prefix):]}"
+    return url
+
+
 def _fetch_single_oa_link(pmc_id: str) -> tuple[str, dict[str, str] | None, str]:
     """
-    查询单个 PMCID 的 OA 资源链接。
+    查询单个 PMCID 的 OA 资源链接（使用 PMC Cloud Service）。
     返回 (pmc_id, links | None, status)，status ∈ {"ok", "not_oa", "network_fail"}。
+    network_fail 仅表示真实的网络/5xx故障，not_oa 表示无可用资源。
     """
-    parser = etree.XMLParser(recover=True)
-
-    r = _request_oa_with_retry(PMC_OA_API, params={"id": pmc_id}, timeout=30)
-    if r is None:
-        logger.warning(f"  单条查询失败（网络）: {pmc_id}（API 请求失败）")
-        return pmc_id, None, "network_fail"
-
     try:
-        root = etree.fromstring(r.content, parser=parser)
-    except Exception as e:
-        logger.warning(f"  单条查询 XML 解析失败: {pmc_id} -> {e}")
+        versions = _list_s3_versions(pmc_id)
+    except requests.RequestException as e:
+        logger.warning(f"  单条查询失败（网络）: {pmc_id}（S3 列表失败）-> {e}")
         return pmc_id, None, "network_fail"
-
-    error = root.find(".//error")
-    if error is not None and error.get("code") in ("idIsNotOpenAccess", "idDoesNotExist"):
+    
+    if not versions:
+        logger.info(f"  {pmc_id} 无可用版本（非 OA 文献）")
         return pmc_id, None, "not_oa"
-
-    record = root.find(".//record")
-    if record is None and root.tag == "record":
-        record = root
-    if record is None:
-        return pmc_id, None, "network_fail"
-
-    links: dict[str, str] = {}
-    pdf_link_node = record.find(".//link[@format='pdf']")
-    if pdf_link_node is not None and pdf_link_node.get("href"):
-        links["pdf"] = normalize_pmc_asset_url(pdf_link_node.get("href"))
-
-    tgz_link_node = record.find(".//link[@format='tgz']")
-    if tgz_link_node is not None and tgz_link_node.get("href"):
-        links["tgz"] = normalize_pmc_asset_url(tgz_link_node.get("href"))
-
-    if not links:
-        return pmc_id, None, "network_fail"
-
-    return pmc_id, links, "ok"
+    
+    # 按版本号升序查找最佳资源
+    best_candidate = None
+    candidate_priority = 0  # 0=无, 1=txt, 2=pdf(手稿), 3=pdf(非手稿)
+    
+    for version in versions:
+        try:
+            metadata = _fetch_cloud_metadata(pmc_id, version)
+        except requests.RequestException as e:
+            logger.warning(f"  {pmc_id} 版本 {version} 元数据获取失败（网络）-> {e}")
+            # 网络错误，直接返回 network_fail
+            return pmc_id, None, "network_fail"
+        
+        if metadata is None:
+            # 404，继续尝试下一个版本
+            continue
+        
+        # 优先选择非手稿的 PDF
+        if metadata.get("pdf_url") and not metadata.get("is_manuscript", False):
+            if candidate_priority < 3:
+                best_candidate = metadata
+                candidate_priority = 3
+        # 其次选择手稿的 PDF
+        elif metadata.get("pdf_url") and metadata.get("is_manuscript", False):
+            if candidate_priority < 2:
+                best_candidate = metadata
+                candidate_priority = 2
+        # 最后选择 TXT
+        elif metadata.get("text_url") and candidate_priority < 1:
+            best_candidate = metadata
+            candidate_priority = 1
+    
+    if best_candidate:
+        links = {}
+        if best_candidate.get("pdf_url"):
+            links["pdf"] = _s3_uri_to_https(best_candidate["pdf_url"])
+        if best_candidate.get("text_url"):
+            links["txt"] = _s3_uri_to_https(best_candidate["text_url"])
+        
+        logger.info(f"  {pmc_id} 获取到资源（优先级 {candidate_priority}）")
+        return pmc_id, links, "ok"
+    else:
+        logger.info(f"  {pmc_id} 所有版本均无可用资源（非 OA 文献）")
+        return pmc_id, None, "not_oa"
 
 
 def load_cached_oa_links(
@@ -179,6 +292,7 @@ def load_cached_oa_links(
     """
     从历史导出的 OA 链接清单中加载可复用链接。
     只返回当前 `pmc_ids` 范围内的记录。
+    跳过已失效的 FTP 链接（NCBI FTP 路径已于 2026-08 删除）。
     """
     if not pmc_ids:
         return {}
@@ -202,6 +316,13 @@ def load_cached_oa_links(
                     links: dict[str, str] = {}
                     pdf_url = normalize_pmc_asset_url(row.get("pdf_url", "")) if row.get("pdf_url") else ""
                     tgz_url = normalize_pmc_asset_url(row.get("tgz_url", "")) if row.get("tgz_url") else ""
+                    
+                    # 跳过已失效的 FTP 链接
+                    if pdf_url and (pdf_url.startswith("ftp://") or "ftp.ncbi.nlm.nih.gov" in pdf_url):
+                        continue
+                    if tgz_url and (tgz_url.startswith("ftp://") or "ftp.ncbi.nlm.nih.gov" in tgz_url):
+                        continue
+                    
                     if pdf_url:
                         links["pdf"] = pdf_url
                     if tgz_url:
@@ -220,9 +341,10 @@ def fetch_oa_links(
     cached_links: dict[str, dict[str, str]] | None = None,
 ) -> tuple[dict[str, dict[str, str]], list[str]]:
     """
-    获取 PMCID 对应的 OA 资源链接（pdf/tgz）。
-    `oa.fcgi` 仅支持单 ID 查询，这里用并发 + 速率控制逐条查询。
+    获取 PMCID 对应的 OA 资源链接（pdf/txt）。
+    使用 PMC Cloud Service (2026-08) 替代已下线的 oa.fcgi API。
     返回 (链接字典, 网络失败 PMCID 列表)；非 OA 的 PMCID 不进任何结果。
+    network_fail 表示真实的网络/5xx故障，not_oa 表示无可用资源（不进失败列表）。
     """
     if not pmc_ids:
         return {}, []
@@ -641,17 +763,23 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
 
 def download_oa_pdf(links: dict[str, str], pdf_path: Path) -> bool:
     """
-    下载整篇正文 PDF，不做 txt 回退。
-    优先 pdf 直链；无直链或直链失败时从 tgz 包内提取正文 PDF。
+    下载整篇正文 PDF，支持 txt 回退。
+    优先 pdf 直链；无直链或直链失败时从 tgz 包内提取正文 PDF；
+    无 pdf/tgz 但有 txt 时下载 txt 文件。
     返回是否成功。
     """
     pdf_url = links.get("pdf")
     tgz_url = links.get("tgz")
+    txt_url = links.get("txt")
 
     if pdf_url and download_pdf_file(pdf_url, pdf_path):
         return True
 
     if tgz_url and download_pdf_from_tgz(tgz_url, pdf_path):
+        return True
+
+    # 新增：TXT 回退路径
+    if txt_url and download_pdf_file(txt_url, pdf_path.with_suffix(".txt")):
         return True
 
     return False

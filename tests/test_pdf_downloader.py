@@ -4,6 +4,7 @@ import io
 import tarfile
 import tempfile
 import csv
+import requests
 from pathlib import Path
 
 from downloader.pdf_downloader import (
@@ -45,8 +46,8 @@ class TestPmcIdNormalize(unittest.TestCase):
 class TestFetchOaLinks(unittest.TestCase):
     @patch("downloader.pdf_downloader.time.sleep")
     @patch("downloader.pdf_downloader.requests.get")
-    def test_should_fetch_batch_and_parse_pdf_tgz(self, mock_get, _mock_sleep):
-        def build_resp(xml_text: str):
+    def test_should_fetch_batch_and_parse_pdf_txt(self, mock_get, _mock_sleep):
+        def build_xml_resp(xml_text: str):
             resp = Mock()
             resp.status_code = 200
             resp.content = xml_text.encode("utf-8")
@@ -55,37 +56,81 @@ class TestFetchOaLinks(unittest.TestCase):
 
         def fake_get(_url, params=None, timeout=30, **kwargs):
             self.assertEqual(timeout, 30)
-            if params.get("id") == "PMC4334330":
-                return build_resp(
-                    "<OA><records><record id='PMC4334330'>"
-                    "<link format='pdf' href='ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/a/b/test.PMC4334330.pdf' />"
-                    "<link format='tgz' href='ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/a/b/PMC4334330.tar.gz' />"
-                    "</record></records></OA>"
-                )
-            return build_resp(
-                "<OA><error code='idDoesNotExist'>PMCXXXX</error></OA>"
-            )
+            if params and params.get("list-type") == "2":
+                # S3 listing response（prefix 通过 params 传递，不在 URL 中）
+                if params.get("prefix") == "PMC4334330.":
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b"""
+                    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <CommonPrefixes>
+                            <Prefix>PMC4334330.1/</Prefix>
+                        </CommonPrefixes>
+                    </ListBucketResult>
+                    """
+                    resp.raise_for_status = Mock()
+                    return resp
+                elif params.get("prefix") == "PMC4334331.":
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b"""
+                    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <CommonPrefixes>
+                            <Prefix>PMC4334331.1/</Prefix>
+                        </CommonPrefixes>
+                    </ListBucketResult>
+                    """
+                    resp.raise_for_status = Mock()
+                    return resp
+                else:
+                    # Empty response for non-existent PMC
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b"""
+                    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <CommonPrefixes>
+                        </CommonPrefixes>
+                    </ListBucketResult>
+                    """
+                    resp.raise_for_status = Mock()
+                    return resp
+            else:
+                # Metadata response
+                if "PMC4334330.1" in _url:
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b'{"pmcid": "PMC4334330", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC4334330.1/PMC4334330.1.pdf", "text_url": "", "is_pmc_openaccess": true, "is_manuscript": false}'
+                    resp.raise_for_status = Mock()
+                    resp.json.return_value = {"pmcid": "PMC4334330", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC4334330.1/PMC4334330.1.pdf", "text_url": "", "is_pmc_openaccess": True, "is_manuscript": False}
+                    return resp
+                elif "PMC4334331.1" in _url:
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b'{"pmcid": "PMC4334331", "version": "1", "text_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC4334331.1/PMC4334331.1.txt", "pdf_url": "", "is_pmc_openaccess": true, "is_manuscript": false}'
+                    resp.raise_for_status = Mock()
+                    resp.json.return_value = {"pmcid": "PMC4334331", "version": "1", "text_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC4334331.1/PMC4334331.1.txt", "pdf_url": "", "is_pmc_openaccess": True, "is_manuscript": False}
+                    return resp
 
         mock_get.side_effect = fake_get
 
-        result, failed = fetch_oa_links(["PMC4334330", "PMCXXXX"])
+        result, failed = fetch_oa_links(["PMC4334330", "PMC4334331", "PMCXXXX"])
 
         self.assertEqual(
             result["PMC4334330"]["pdf"],
-            "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_pdf/a/b/test.PMC4334330.pdf",
+            "https://pmc-oa-opendata.s3.amazonaws.com/PMC4334330.1/PMC4334330.1.pdf",
         )
         self.assertEqual(
-            result["PMC4334330"]["tgz"],
-            "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_package/a/b/PMC4334330.tar.gz",
+            result["PMC4334331"]["txt"],
+            "https://pmc-oa-opendata.s3.amazonaws.com/PMC4334331.1/PMC4334331.1.txt",
         )
         self.assertNotIn("PMCXXXX", result)
         self.assertEqual(failed, [])
-        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(mock_get.call_count, 5)  # 3 S3 listings + 2 metadata calls
 
     @patch("downloader.pdf_downloader.time.sleep")
     @patch("downloader.pdf_downloader.requests.get")
     def test_should_retry_single_query_for_unresolved_ids(self, mock_get, _mock_sleep):
-        def build_resp(xml_text: str):
+        def build_xml_resp(xml_text: str):
             resp = Mock()
             resp.status_code = 200
             resp.content = xml_text.encode("utf-8")
@@ -93,21 +138,48 @@ class TestFetchOaLinks(unittest.TestCase):
             return resp
 
         def fake_get(_url, params=None, timeout=30, **kwargs):
-            if params == {"id": "PMC1"}:
-                return build_resp(
-                    "<OA><records><record id='PMC1'>"
-                    "<link format='pdf' href='ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/a/b/1.pdf' />"
-                    "</record></records></OA>"
-                )
-
-            if params == {"id": "PMC2"}:
-                return build_resp(
-                    "<OA><records><record id='PMC2'>"
-                    "<link format='tgz' href='ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_package/a/b/2.tar.gz' />"
-                    "</record></records></OA>"
-                )
-
-            return build_resp("<OA></OA>")
+            if params and params.get("list-type") == "2":
+                # S3 listing response（prefix 通过 params 传递，不在 URL 中）
+                if params.get("prefix") == "PMC1.":
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b"""
+                    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <CommonPrefixes>
+                            <Prefix>PMC1.1/</Prefix>
+                        </CommonPrefixes>
+                    </ListBucketResult>
+                    """
+                    resp.raise_for_status = Mock()
+                    return resp
+                elif params.get("prefix") == "PMC2.":
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b"""
+                    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <CommonPrefixes>
+                            <Prefix>PMC2.1/</Prefix>
+                        </CommonPrefixes>
+                    </ListBucketResult>
+                    """
+                    resp.raise_for_status = Mock()
+                    return resp
+            else:
+                # Metadata response
+                if "PMC1.1" in _url:
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b'{"pmcid": "PMC1", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC1.1/PMC1.1.pdf", "text_url": "", "is_pmc_openaccess": true, "is_manuscript": false}'
+                    resp.raise_for_status = Mock()
+                    resp.json.return_value = {"pmcid": "PMC1", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC1.1/PMC1.1.pdf", "text_url": "", "is_pmc_openaccess": True, "is_manuscript": False}
+                    return resp
+                elif "PMC2.1" in _url:
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b'{"pmcid": "PMC2", "version": "1", "text_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC2.1/PMC2.1.txt", "pdf_url": "", "is_pmc_openaccess": true, "is_manuscript": false}'
+                    resp.raise_for_status = Mock()
+                    resp.json.return_value = {"pmcid": "PMC2", "version": "1", "text_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC2.1/PMC2.1.txt", "pdf_url": "", "is_pmc_openaccess": True, "is_manuscript": False}
+                    return resp
 
         mock_get.side_effect = fake_get
 
@@ -115,7 +187,7 @@ class TestFetchOaLinks(unittest.TestCase):
 
         self.assertIn("PMC1", result)
         self.assertIn("PMC2", result)
-        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(mock_get.call_count, 4)  # 2 S3 listings + 2 metadata calls
 
     @patch("downloader.pdf_downloader.requests.get")
     def test_should_reuse_cached_links_without_remote_fetch(self, mock_get):
@@ -475,15 +547,28 @@ class TestFetchOaLinksProxy(unittest.TestCase):
 
         def fake_get(url, **kwargs):
             captured.update(kwargs)
-            resp = Mock()
-            resp.status_code = 200
-            resp.content = (
-                "<OA><records><record id='PMC123'>"
-                "<link format='pdf' href='https://example.org/1.pdf'/>"
-                "</record></records></OA>"
-            ).encode()
-            resp.raise_for_status = Mock()
-            return resp
+            params = kwargs.get("params") or {}
+            if params.get("list-type") == "2":
+                # S3 listing response
+                resp = Mock()
+                resp.status_code = 200
+                resp.content = b"""
+                <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <CommonPrefixes>
+                        <Prefix>PMC123.1/</Prefix>
+                    </CommonPrefixes>
+                </ListBucketResult>
+                """
+                resp.raise_for_status = Mock()
+                return resp
+            else:
+                # Metadata response
+                resp = Mock()
+                resp.status_code = 200
+                resp.content = b'{"pmcid": "PMC123", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC123.1/PMC123.1.pdf", "text_url": "", "is_pmc_openaccess": true, "is_manuscript": false}'
+                resp.raise_for_status = Mock()
+                resp.json.return_value = {"pmcid": "PMC123", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC123.1/PMC123.1.pdf", "text_url": "", "is_pmc_openaccess": True, "is_manuscript": False}
+                return resp
 
         mock_get.side_effect = fake_get
         with patch("downloader.pdf_downloader.PROXY", "http://127.0.0.1:7890"):
@@ -502,12 +587,26 @@ class TestFetchOaLinksProxy(unittest.TestCase):
 
         def fake_get(url, **kwargs):
             captured.update(kwargs)
+            params = kwargs.get("params") or {}
+            if params.get("list-type") == "2":
+                # S3 listing response
+                resp = Mock()
+                resp.status_code = 200
+                resp.content = b"""
+                <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <CommonPrefixes>
+                        <Prefix>PMC456.1/</Prefix>
+                    </CommonPrefixes>
+                </ListBucketResult>
+                """
+                resp.raise_for_status = Mock()
+                return resp
+            # Metadata response
             resp = Mock()
             resp.status_code = 200
-            resp.content = (
-                "<record><link format='pdf' href='https://example.org/2.pdf'/></record>"
-            ).encode()
+            resp.content = b'{"pmcid": "PMC456", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC456.1/PMC456.1.pdf", "text_url": "", "is_pmc_openaccess": true, "is_manuscript": false}'
             resp.raise_for_status = Mock()
+            resp.json.return_value = {"pmcid": "PMC456", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC456.1/PMC456.1.pdf", "text_url": "", "is_pmc_openaccess": True, "is_manuscript": False}
             return resp
 
         mock_get.side_effect = fake_get
@@ -518,66 +617,74 @@ class TestFetchOaLinksProxy(unittest.TestCase):
 
 
 class TestFetchSingleOaLinkClassification(unittest.TestCase):
-    def _resp(self, xml_text: str):
-        resp = Mock()
-        resp.status_code = 200
-        resp.content = xml_text.encode("utf-8")
-        resp.raise_for_status = Mock()
-        return resp
-
-    @patch("downloader.pdf_downloader._request_oa_with_retry")
-    def test_should_classify_ok_when_record_with_links(self, mock_req):
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_classify_ok_when_record_with_links(self, mock_fetch_metadata, mock_list_versions):
         from downloader.pdf_downloader import _fetch_single_oa_link
 
-        mock_req.return_value = self._resp(
-            "<OA><records><record id='PMC1'>"
-            "<link format='pdf' href='https://a/1.pdf'/>"
-            "<link format='tgz' href='https://a/1.tgz'/>"
-            "</record></records></OA>"
-        )
+        mock_list_versions.return_value = [1]
+        mock_fetch_metadata.return_value = {
+            "pmcid": "PMC1",
+            "version": "1",
+            "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC1.1/PMC1.1.pdf",
+            "text_url": "",
+            "is_pmc_openaccess": True,
+            "is_manuscript": False
+        }
 
         pid, links, status = _fetch_single_oa_link("PMC1")
 
         self.assertEqual(pid, "PMC1")
-        self.assertEqual(links, {"pdf": "https://a/1.pdf", "tgz": "https://a/1.tgz"})
+        self.assertEqual(links, {"pdf": "https://pmc-oa-opendata.s3.amazonaws.com/PMC1.1/PMC1.1.pdf"})
         self.assertEqual(status, "ok")
 
-    @patch("downloader.pdf_downloader._request_oa_with_retry")
-    def test_should_classify_not_oa_when_open_access_error(self, mock_req):
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    def test_should_classify_not_oa_when_no_versions(self, mock_list_versions):
         from downloader.pdf_downloader import _fetch_single_oa_link
 
-        mock_req.return_value = self._resp(
-            "<OA><error code='idIsNotOpenAccess'>PMC1 is not Open Access</error></OA>"
-        )
+        mock_list_versions.return_value = []
+
         pid, links, status = _fetch_single_oa_link("PMC1")
         self.assertEqual(status, "not_oa")
         self.assertIsNone(links)
 
-    @patch("downloader.pdf_downloader._request_oa_with_retry")
-    def test_should_classify_not_oa_when_id_does_not_exist(self, mock_req):
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_classify_not_oa_when_no_urls(self, mock_fetch_metadata, mock_list_versions):
         from downloader.pdf_downloader import _fetch_single_oa_link
 
-        mock_req.return_value = self._resp(
-            "<OA><error code='idDoesNotExist'>PMC9 does not exist</error></OA>"
-        )
-        pid, links, status = _fetch_single_oa_link("PMC9")
+        mock_list_versions.return_value = [1]
+        mock_fetch_metadata.return_value = {
+            "pmcid": "PMC1",
+            "version": "1",
+            "pdf_url": "",
+            "text_url": "",
+            "is_pmc_openaccess": True,
+            "is_manuscript": False
+        }
+
+        pid, links, status = _fetch_single_oa_link("PMC1")
         self.assertEqual(status, "not_oa")
         self.assertIsNone(links)
 
-    @patch("downloader.pdf_downloader._request_oa_with_retry")
-    def test_should_classify_network_fail_when_request_failed(self, mock_req):
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    def test_should_classify_network_fail_when_list_versions_failed(self, mock_list_versions):
         from downloader.pdf_downloader import _fetch_single_oa_link
 
-        mock_req.return_value = None
+        mock_list_versions.side_effect = requests.ConnectionError("Network error")
+
         pid, links, status = _fetch_single_oa_link("PMC2")
         self.assertEqual(status, "network_fail")
         self.assertIsNone(links)
 
-    @patch("downloader.pdf_downloader._request_oa_with_retry")
-    def test_should_classify_network_fail_when_no_record_no_error(self, mock_req):
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_classify_network_fail_when_metadata_failed(self, mock_fetch_metadata, mock_list_versions):
         from downloader.pdf_downloader import _fetch_single_oa_link
 
-        mock_req.return_value = self._resp("<OA></OA>")
+        mock_list_versions.return_value = [1]
+        mock_fetch_metadata.side_effect = requests.ConnectionError("Network error")
+
         pid, links, status = _fetch_single_oa_link("PMC3")
         self.assertEqual(status, "network_fail")
         self.assertIsNone(links)
@@ -592,21 +699,45 @@ class TestFetchOaLinksClassification(unittest.TestCase):
         def fake_get(url, **kwargs):
             captured.setdefault("count", 0)
             captured["count"] += 1
-            pid = (kwargs.get("params") or {}).get("id")
-            resp = Mock()
-            resp.status_code = 200
-            resp.raise_for_status = Mock()
-            if pid == "PMC_OK":
-                resp.content = (
-                    "<record><link format='pdf' href='https://a/ok.pdf'/></record>"
-                ).encode("utf-8")
-            elif pid == "PMC_NOT_OA":
-                resp.content = (
-                    "<OA><error code='idIsNotOpenAccess'>x</error></OA>"
-                ).encode("utf-8")
+            params = kwargs.get("params") or {}
+            if params.get("list-type") == "2":
+                if params.get("prefix") == "PMC_OK.":
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b"""
+                    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <CommonPrefixes>
+                            <Prefix>PMC_OK.1/</Prefix>
+                        </CommonPrefixes>
+                    </ListBucketResult>
+                    """
+                    resp.raise_for_status = Mock()
+                    return resp
+                elif params.get("prefix") == "PMC_NOT_OA.":
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b"""
+                    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                        <CommonPrefixes>
+                        </CommonPrefixes>
+                    </ListBucketResult>
+                    """
+                    resp.raise_for_status = Mock()
+                    return resp
+                else:
+                    # PMC_NET：listing 阶段网络异常
+                    raise requests.ConnectionError("Network error")
             else:
-                resp.content = b"<OA></OA>"
-            return resp
+                if "PMC_OK.1" in url:
+                    resp = Mock()
+                    resp.status_code = 200
+                    resp.content = b'{"pmcid": "PMC_OK", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC_OK.1/PMC_OK.1.pdf", "text_url": "", "is_pmc_openaccess": true, "is_manuscript": false}'
+                    resp.raise_for_status = Mock()
+                    resp.json.return_value = {"pmcid": "PMC_OK", "version": "1", "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC_OK.1/PMC_OK.1.pdf", "text_url": "", "is_pmc_openaccess": True, "is_manuscript": False}
+                    return resp
+                else:
+                    # Network error
+                    raise requests.ConnectionError("Network error")
 
         mock_get.side_effect = fake_get
 
@@ -615,7 +746,7 @@ class TestFetchOaLinksClassification(unittest.TestCase):
         self.assertIn("PMC_OK", result)
         self.assertNotIn("PMC_NOT_OA", result)
         self.assertEqual(failed, ["PMC_NET"])
-        self.assertEqual(captured["count"], 3)
+        self.assertEqual(captured["count"], 4)  # 2 S3 listings + 1 metadata + 1 network error
 
 
 class TestExportOaLinksCsv(unittest.TestCase):
@@ -948,6 +1079,409 @@ class TestRunPdfWriteCheckpoint(unittest.TestCase):
                     checkpoint_exists = _pdf_checkpoint_path().exists()
 
         self.assertTrue(checkpoint_exists)
+
+
+class TestListS3Versions(unittest.TestCase):
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_parse_versions_from_xml_response(self, mock_get):
+        from downloader.pdf_downloader import _list_s3_versions
+        
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.content = b"""
+        <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <CommonPrefixes>
+                <Prefix>PMC123456.1/</Prefix>
+                <Prefix>PMC123456.2/</Prefix>
+            </CommonPrefixes>
+        </ListBucketResult>
+        """
+        mock_get.return_value = mock_response
+        
+        versions = _list_s3_versions("PMC123456")
+        self.assertEqual(versions, [1, 2])
+    
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_handle_collision_guard(self, mock_get):
+        from downloader.pdf_downloader import _list_s3_versions
+        
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.content = b"""
+        <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <CommonPrefixes>
+                <Prefix>PMC5190450.1/</Prefix>
+            </CommonPrefixes>
+        </ListBucketResult>
+        """
+        mock_get.return_value = mock_response
+        
+        versions = _list_s3_versions("PMC519045")
+        self.assertEqual(versions, [])
+    
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_handle_pseudo_prefix_guard(self, mock_get):
+        from downloader.pdf_downloader import _list_s3_versions
+        
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.content = b"""
+        <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <CommonPrefixes>
+                <Prefix>PMC196576.</Prefix>
+            </CommonPrefixes>
+        </ListBucketResult>
+        """
+        mock_get.return_value = mock_response
+        
+        versions = _list_s3_versions("PMC196576")
+        self.assertEqual(versions, [])
+    
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_return_empty_for_empty_response(self, mock_get):
+        from downloader.pdf_downloader import _list_s3_versions
+        
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.content = b"""
+        <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <CommonPrefixes>
+            </CommonPrefixes>
+        </ListBucketResult>
+        """
+        mock_get.return_value = mock_response
+        
+        versions = _list_s3_versions("PMC123456")
+        self.assertEqual(versions, [])
+    
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_handle_continuation_token(self, mock_get):
+        from downloader.pdf_downloader import _list_s3_versions
+        
+        # First call returns continuation token
+        mock_response1 = Mock()
+        mock_response1.status_code = 200
+        mock_response1.raise_for_status = Mock()
+        mock_response1.content = b"""
+        <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <CommonPrefixes>
+                <Prefix>PMC123456.1/</Prefix>
+            </CommonPrefixes>
+            <NextContinuationToken>token123</NextContinuationToken>
+        </ListBucketResult>
+        """
+        
+        # Second call returns remaining versions
+        mock_response2 = Mock()
+        mock_response2.status_code = 200
+        mock_response2.raise_for_status = Mock()
+        mock_response2.content = b"""
+        <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+            <CommonPrefixes>
+                <Prefix>PMC123456.2/</Prefix>
+                <Prefix>PMC123456.3/</Prefix>
+            </CommonPrefixes>
+        </ListBucketResult>
+        """
+        
+        mock_get.side_effect = [mock_response1, mock_response2]
+        
+        versions = _list_s3_versions("PMC123456")
+        self.assertEqual(versions, [1, 2, 3])
+        self.assertEqual(mock_get.call_count, 2)
+
+
+class TestFetchCloudMetadata(unittest.TestCase):
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_return_json_on_success(self, mock_get):
+        from downloader.pdf_downloader import _fetch_cloud_metadata
+        
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "pmcid": "PMC123456",
+            "version": "1",
+            "pdf_url": "https://example.com/test.pdf",
+            "is_pmc_openaccess": True
+        }
+        mock_get.return_value = mock_response
+        
+        metadata = _fetch_cloud_metadata("PMC123456", 1)
+        self.assertEqual(metadata, {
+            "pmcid": "PMC123456",
+            "version": "1",
+            "pdf_url": "https://example.com/test.pdf",
+            "is_pmc_openaccess": True
+        })
+    
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_return_none_on_404(self, mock_get):
+        from downloader.pdf_downloader import _fetch_cloud_metadata
+        
+        mock_response = Mock()
+        mock_response.status_code = 404
+        mock_response.raise_for_status.side_effect = requests.HTTPError("404 Not Found")
+        mock_get.return_value = mock_response
+        
+        metadata = _fetch_cloud_metadata("PMC123456", 1)
+        self.assertIsNone(metadata)
+    
+    @patch("downloader.pdf_downloader.requests.get")
+    def test_should_propagate_other_http_errors(self, mock_get):
+        from downloader.pdf_downloader import _fetch_cloud_metadata
+        
+        mock_response = Mock()
+        mock_response.status_code = 500
+        mock_response.raise_for_status.side_effect = requests.HTTPError("500 Server Error")
+        mock_get.return_value = mock_response
+        
+        with self.assertRaises(requests.HTTPError):
+            _fetch_cloud_metadata("PMC123456", 1)
+
+
+class TestFetchSingleOaLinkCloud(unittest.TestCase):
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_return_ok_with_pdf_url(self, mock_fetch_metadata, mock_list_versions):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+        
+        mock_list_versions.return_value = [1]
+        mock_fetch_metadata.return_value = {
+            "pmcid": "PMC123456",
+            "version": "1",
+            "pdf_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC123456.1/PMC123456.1.pdf",
+            "is_pmc_openaccess": True,
+            "is_manuscript": False
+        }
+        
+        pmc_id, links, status = _fetch_single_oa_link("PMC123456")
+        
+        self.assertEqual(pmc_id, "PMC123456")
+        self.assertEqual(links, {
+            "pdf": "https://pmc-oa-opendata.s3.amazonaws.com/PMC123456.1/PMC123456.1.pdf"
+        })
+        self.assertEqual(status, "ok")
+    
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_return_ok_with_txt_url_only(self, mock_fetch_metadata, mock_list_versions):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+        
+        mock_list_versions.return_value = [1]
+        mock_fetch_metadata.return_value = {
+            "pmcid": "PMC123456",
+            "version": "1",
+            "text_url": "https://pmc-oa-opendata.s3.amazonaws.com/PMC123456.1/PMC123456.1.txt",
+            "is_pmc_openaccess": True,
+            "is_manuscript": False,
+            "pdf_url": ""
+        }
+        
+        pmc_id, links, status = _fetch_single_oa_link("PMC123456")
+        
+        self.assertEqual(pmc_id, "PMC123456")
+        self.assertEqual(links, {
+            "txt": "https://pmc-oa-opendata.s3.amazonaws.com/PMC123456.1/PMC123456.1.txt"
+        })
+        self.assertEqual(status, "ok")
+    
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    def test_should_return_not_oa_when_no_versions(self, mock_list_versions):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+        
+        mock_list_versions.return_value = []
+        
+        pmc_id, links, status = _fetch_single_oa_link("PMC123456")
+        
+        self.assertEqual(pmc_id, "PMC123456")
+        self.assertIsNone(links)
+        self.assertEqual(status, "not_oa")
+    
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_return_not_oa_when_no_urls(self, mock_fetch_metadata, mock_list_versions):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+        
+        mock_list_versions.return_value = [1]
+        mock_fetch_metadata.return_value = {
+            "pmcid": "PMC123456",
+            "version": "1",
+            "is_pmc_openaccess": True,
+            "is_manuscript": False,
+            "pdf_url": "",
+            "text_url": ""
+        }
+        
+        pmc_id, links, status = _fetch_single_oa_link("PMC123456")
+        
+        self.assertEqual(pmc_id, "PMC123456")
+        self.assertIsNone(links)
+        self.assertEqual(status, "not_oa")
+    
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    def test_should_return_network_fail_on_list_versions_error(self, mock_list_versions):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+        
+        mock_list_versions.side_effect = requests.ConnectionError("Network error")
+        
+        pmc_id, links, status = _fetch_single_oa_link("PMC123456")
+        
+        self.assertEqual(pmc_id, "PMC123456")
+        self.assertIsNone(links)
+        self.assertEqual(status, "network_fail")
+    
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_return_network_fail_on_metadata_error(self, mock_fetch_metadata, mock_list_versions):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+        
+        mock_list_versions.return_value = [1]
+        mock_fetch_metadata.side_effect = requests.ConnectionError("Network error")
+        
+        pmc_id, links, status = _fetch_single_oa_link("PMC123456")
+        
+        self.assertEqual(pmc_id, "PMC123456")
+        self.assertIsNone(links)
+        self.assertEqual(status, "network_fail")
+    
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_continue_on_404_metadata(self, mock_fetch_metadata, mock_list_versions):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+        
+        mock_list_versions.return_value = [1, 2]
+        mock_fetch_metadata.side_effect = [None, {
+            "pmcid": "PMC123456",
+            "version": "2",
+            "pdf_url": "https://example.com/test.pdf",
+            "is_pmc_openaccess": True,
+            "is_manuscript": False
+        }]
+        
+        pmc_id, links, status = _fetch_single_oa_link("PMC123456")
+        
+        self.assertEqual(pmc_id, "PMC123456")
+        self.assertEqual(links, {
+            "pdf": "https://example.com/test.pdf"
+        })
+        self.assertEqual(status, "ok")
+    
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_prefer_non_manuscript_pdf(self, mock_fetch_metadata, mock_list_versions):
+        from downloader.pdf_downloader import _fetch_single_oa_link
+        
+        mock_list_versions.return_value = [1, 2]
+        mock_fetch_metadata.side_effect = [
+            {
+                "pmcid": "PMC123456",
+                "version": "1",
+                "pdf_url": "https://example.com/manuscript.pdf",
+                "is_pmc_openaccess": True,
+                "is_manuscript": True
+            },
+            {
+                "pmcid": "PMC123456",
+                "version": "2",
+                "pdf_url": "https://example.com/article.pdf",
+                "is_pmc_openaccess": True,
+                "is_manuscript": False
+            }
+        ]
+        
+        pmc_id, links, status = _fetch_single_oa_link("PMC123456")
+        
+        self.assertEqual(pmc_id, "PMC123456")
+        self.assertEqual(links, {
+            "pdf": "https://example.com/article.pdf"
+        })
+        self.assertEqual(status, "ok")
+
+
+    @patch("downloader.pdf_downloader._list_s3_versions")
+    @patch("downloader.pdf_downloader._fetch_cloud_metadata")
+    def test_should_translate_s3_uri_to_https(self, mock_fetch_metadata, mock_list_versions):
+        """真实 JSON 返回 s3:// URI，aria2c 不支持该协议，须转为 HTTPS 直链"""
+        from downloader.pdf_downloader import _fetch_single_oa_link
+
+        mock_list_versions.return_value = [1]
+        mock_fetch_metadata.return_value = {
+            "pmcid": "PMC123456",
+            "version": "1",
+            "pdf_url": "s3://pmc-oa-opendata/PMC123456.1/PMC123456.1.pdf?md5=abc123",
+            "is_pmc_openaccess": True,
+            "is_manuscript": False
+        }
+
+        pmc_id, links, status = _fetch_single_oa_link("PMC123456")
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(
+            links["pdf"],
+            "https://pmc-oa-opendata.s3.amazonaws.com/PMC123456.1/PMC123456.1.pdf?md5=abc123",
+        )
+
+
+class TestLoadCachedOaLinksLegacyUrls(unittest.TestCase):
+    def test_should_skip_ftp_urls(self):
+        from downloader.pdf_downloader import load_cached_oa_links
+        
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            csv_file = out_dir / "oa_download_links_20260101_010101.csv"
+            csv_file.write_text(
+                "pmid,pmc_id,label,pdf_url,tgz_url\n"
+                "111,PMC1,高相关,ftp://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_pdf/a/b/1.PMC1.pdf,\n"
+                "222,PMC2,中相关,https://example.org/2.pdf,\n",
+                encoding="utf-8-sig",
+            )
+            
+            cached = load_cached_oa_links(["PMC1", "PMC2"], out_dir=out_dir)
+            
+            self.assertNotIn("PMC1", cached)
+            self.assertIn("PMC2", cached)
+            self.assertEqual(cached["PMC2"]["pdf"], "https://example.org/2.pdf")
+    
+    def test_should_skip_urls_containing_ftp_domain(self):
+        from downloader.pdf_downloader import load_cached_oa_links
+        
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = Path(td)
+            csv_file = out_dir / "oa_download_links_20260101_010101.csv"
+            csv_file.write_text(
+                "pmid,pmc_id,label,pdf_url,tgz_url\n"
+                "111,PMC1,高相关,https://other.site/ftp.ncbi.nlm.nih.gov/file.pdf,\n"
+                "222,PMC2,中相关,https://example.org/2.pdf,\n",
+                encoding="utf-8-sig",
+            )
+            
+            cached = load_cached_oa_links(["PMC1", "PMC2"], out_dir=out_dir)
+            
+            self.assertNotIn("PMC1", cached)
+            self.assertIn("PMC2", cached)
+            self.assertEqual(cached["PMC2"]["pdf"], "https://example.org/2.pdf")
+
+
+class TestDownloadOaPdfTxtFallback(unittest.TestCase):
+    @patch("downloader.pdf_downloader.download_pdf_file")
+    def test_should_download_txt_when_no_pdf(self, mock_download_pdf):
+        from downloader.pdf_downloader import download_oa_pdf
+        
+        mock_download_pdf.return_value = True
+        
+        with tempfile.TemporaryDirectory() as td:
+            dest_path = Path(td) / "test.pdf"
+            links = {"txt": "https://example.org/test.txt"}
+            
+            result = download_oa_pdf(links, dest_path)
+            
+            self.assertTrue(result)
+            mock_download_pdf.assert_called_once_with("https://example.org/test.txt", dest_path.with_suffix(".txt"))
 
 
 if __name__ == "__main__":
