@@ -984,6 +984,115 @@ class TestRunPdfRetry(unittest.TestCase):
         )
 
 
+class TestNetworkFailedRespectsExistingFiles(unittest.TestCase):
+    """
+    取链全部失败时，已在本地存在的 PDF/TXT 不得被误标为失败。
+
+    回归背景：oa.fcgi 下线期间 823 篇全部被归为 network_fail，其中 636 篇
+    实际早已下载好。原因是 oa_links 为空时，下面"已下载则跳过"的循环体
+    一次都不执行，network_failed_items 被无条件塞进失败清单与检查点。
+    """
+
+    def _make_db(self, td: Path, entries: list[tuple[str, str]]) -> Path:
+        import sqlite3
+        db = td / "test.db"
+        conn = sqlite3.connect(db)
+        conn.execute(CREATE_ARTICLES_SQL)
+        conn.execute(CREATE_LLM_VALIDATION_SQL)
+        for pmid, pmc_id in entries:
+            conn.execute("INSERT INTO articles (pmid, pmc_id) VALUES (?, ?)", (pmid, pmc_id))
+            conn.execute(
+                "INSERT INTO llm_validation (pmid, llm_verdict) VALUES (?, 'RELEVANT')", (pmid,)
+            )
+        conn.commit()
+        conn.close()
+        return db
+
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.load_cached_oa_links")
+    @patch("downloader.pdf_downloader.export_oa_links_csv")
+    def test_should_not_mark_existing_pdf_as_failed(
+        self, mock_export_csv, mock_cached, mock_dl, mock_fetch,
+    ):
+        mock_cached.return_value = {}
+        mock_export_csv.return_value = Path("links.csv")
+        # 取链全失败，两个 PMCID 都没拿到链接
+        mock_fetch.return_value = ({}, ["PMC7001", "PMC7002"])
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            db = self._make_db(td_path, [("1111", "PMC7001"), ("2222", "PMC7002")])
+            # PMC7001 对应的 1111.pdf 已下载好
+            (td_path / "1111.pdf").write_bytes(b"%PDF-1.4 already here")
+
+            with patch("downloader.pdf_downloader.PDF_DIR", td_path):
+                with patch("downloader.pdf_downloader.OUTPUT_DIR", td_path):
+                    from downloader.pdf_downloader import (
+                        run_pdf_download, _load_pdf_checkpoint,
+                    )
+                    run_pdf_download(db_path=db)
+
+                    checkpoint_items = _load_pdf_checkpoint()
+
+                    # 只有缺文件的 2222 应进检查点
+                    self.assertEqual(len(checkpoint_items), 1)
+                    self.assertEqual(checkpoint_items[0]["pmid"], "2222")
+                    self.assertEqual(checkpoint_items[0]["pmc_id"], "PMC7002")
+
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.load_cached_oa_links")
+    @patch("downloader.pdf_downloader.export_oa_links_csv")
+    def test_should_not_mark_existing_txt_as_failed(
+        self, mock_export_csv, mock_cached, mock_dl, mock_fetch,
+    ):
+        mock_cached.return_value = {}
+        mock_export_csv.return_value = Path("links.csv")
+        mock_fetch.return_value = ({}, ["PMC7003"])
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            db = self._make_db(td_path, [("3333", "PMC7003")])
+            (td_path / "3333.txt").write_text("already extracted full text", encoding="utf-8")
+
+            with patch("downloader.pdf_downloader.PDF_DIR", td_path):
+                with patch("downloader.pdf_downloader.OUTPUT_DIR", td_path):
+                    from downloader.pdf_downloader import (
+                        run_pdf_download, _load_pdf_checkpoint, _pdf_checkpoint_path,
+                    )
+                    run_pdf_download(db_path=db)
+
+                    # txt 已存在视为已获取全文，不该记为失败
+                    self.assertFalse(_pdf_checkpoint_path().exists())
+
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.load_cached_oa_links")
+    @patch("downloader.pdf_downloader.export_oa_links_csv")
+    def test_should_count_existing_files_as_skipped(
+        self, mock_export_csv, mock_cached, mock_dl, mock_fetch,
+    ):
+        mock_cached.return_value = {}
+        mock_export_csv.return_value = Path("links.csv")
+        mock_fetch.return_value = ({}, ["PMC7001"])
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            db = self._make_db(td_path, [("4444", "PMC7001")])
+            (td_path / "4444.pdf").write_bytes(b"%PDF-1.4 here")
+
+            with patch("downloader.pdf_downloader.PDF_DIR", td_path):
+                with patch("downloader.pdf_downloader.OUTPUT_DIR", td_path):
+                    from downloader.pdf_downloader import run_pdf_download
+                    with self.assertLogs("pdf_downloader", level="INFO") as logs:
+                        run_pdf_download(db_path=db)
+
+                    summary = [ln for ln in logs.output if "首次下载完成" in ln]
+                    self.assertTrue(summary, "应输出首次下载完成统计")
+                    self.assertIn("跳过 1 篇", summary[0])
+
+
 class TestRunPdfWriteCheckpoint(unittest.TestCase):
     def _make_db_with_pmc(self, td: Path, pmid: str = "1111", pmc_id: str = "PMC1") -> Path:
         import sqlite3

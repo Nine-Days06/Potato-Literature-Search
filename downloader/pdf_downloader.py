@@ -841,22 +841,29 @@ def run_pdf_download(db_path: Path = DB_PATH):
     links_csv = export_oa_links_csv(oa_links=oa_links, pmc_to_info=pmc_to_info)
     logger.info(f"已导出下载链接清单: {links_csv}")
 
-    # 网络失败项并入 failed_items，后续 --step pdf-retry 重新查链并下载
-    network_failed_items: list[dict] = []
-    for pid in network_failed:
-        info = pmc_to_info.get(pid, {})
-        network_failed_items.append({
-            "pmc_id": pid,
-            "links": {},
-            "pdf_path": PDF_DIR / f"{info.get('pmid', '')}.pdf",
-            "pmid": info.get("pmid", ""),
-        })
-
     # 3. 执行下载
     pdf_success_count = 0
     failed_count = 0
     skip_count = 0
     failed_items: list[dict] = []
+
+    # 网络失败项并入 failed_items，后续 --step pdf-retry 重新查链并下载。
+    # 注意：取链整体失败时 oa_links 为空，下方"已下载则跳过"的循环体一次都不会执行，
+    # 因此必须在此处单独过滤本地已存在的 PDF/TXT，否则早已下载成功的文献会被误标为失败
+    # （与 run_pdf_retry 的过滤条件保持一致）。
+    network_failed_items: list[dict] = []
+    for pid in network_failed:
+        info = pmc_to_info.get(pid, {})
+        pdf_path = PDF_DIR / f"{info.get('pmid', '')}.pdf"
+        if pdf_path.exists() or pdf_path.with_suffix(".txt").exists():
+            skip_count += 1
+            continue
+        network_failed_items.append({
+            "pmc_id": pid,
+            "links": {},
+            "pdf_path": pdf_path,
+            "pmid": info.get("pmid", ""),
+        })
 
     # 使用线程池并发下载，提高效率
     with ThreadPoolExecutor(max_workers=DOWNLOAD_MAX_WORKERS) as executor:
