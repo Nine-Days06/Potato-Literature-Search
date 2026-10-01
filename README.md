@@ -220,7 +220,7 @@ python scripts/incremental_update.py --skip-download --skip-parse --validate
 python scripts/incremental_update.py --validate --batch
 
 # 8. 仅增量导出（指定时间戳后新增的复核通过文献）
-python scripts/incremental_update.py --export-since "2025-08-01T00:00:00"
+python scripts/incremental_update.py --export-since "2026-08-09T00:00:00"
 
 # 9. 标记因查询词变化不再匹配的旧 PMID（可选，软保留不删除）
 python scripts/incremental_update.py --mark-removed

@@ -6,18 +6,22 @@
 
 与主流水线对齐：
 - 默认 (无参数)：仅跑步骤 1-3（下载 → 解析 → 硬过滤）
-- --validate：跑 LLM 二次验证（步骤 5）
+- --validate：先跑 1-3，再跑 LLM 二次验证（步骤 5）
 - --export：增量导出本次运行新增的复核通过文献（步骤 6）
-- --export-since "TIMESTAMP"：增量导出指定时间后的复核通过文献
+- --export-since "TIMESTAMP"：**仅**导出该时间后新增的复核通过文献（不跑 1-3）
+
+注意：--export/ --export-since 未搭配 --validate 时为"仅导出"模式，不会执行步骤 1-3。
+--export-since 的时间戳必须晚于上一次 LLM 验证时间，否则会导出全部历史文献
+（运行时会打印告警）。
 
 用法：
     python scripts/incremental_update.py                          # 仅 1-3 步（下载/解析/硬过滤）
-    python scripts/incremental_update.py --validate               # 跑 LLM 验证（增量）
-    python scripts/incremental_update.py --export                 # 增量导出（本次运行新增）
-    python scripts/incremental_update.py --validate --export      # 验证+导出
+    python scripts/incremental_update.py --validate               # 1-3 步 + LLM 验证
+    python scripts/incremental_update.py --export                 # 仅增量导出（本次运行新增）
+    python scripts/incremental_update.py --validate --export      # 1-3 步 + 验证 + 导出（完整增量）
     python scripts/incremental_update.py --query "new" --year-min 2015 --validate --export  # 完整增量
     python scripts/incremental_update.py --skip-download --validate  # 跳过下载，只跑验证
-    python scripts/incremental_update.py --export-since "2025-08-01T00:00:00"  # 指定时间导出
+    python scripts/incremental_update.py --export-since "2026-08-09T00:00:00"  # 仅导出该时间后新增
     python scripts/incremental_update.py --mark-removed           # 标记被排除的旧 PMID
 """
 
@@ -71,7 +75,7 @@ def main():
   python scripts/incremental_update.py --validate --batch
 
   # 7. 仅增量导出（指定时间戳后新增的复核通过文献）
-  python scripts/incremental_update.py --export-since "2025-08-01T00:00:00"
+  python scripts/incremental_update.py --export-since "2026-08-09T00:00:00"
 
   # 8. 标记因查询词变化不再匹配的旧 PMID（可选，软保留不删除）
   python scripts/incremental_update.py --mark-removed
@@ -121,7 +125,8 @@ def main():
     )
     parser.add_argument(
         "--export-since", default=None,
-        help="增量导出指定时间后的复核通过文献 (ISO 格式，如 2025-08-01T00:00:00)"
+        help="仅导出该时间后新增的复核通过文献，不执行步骤 1-3 "
+             "(ISO 格式，如 2026-08-09T00:00:00；须晚于上次验证时间)"
     )
 
     # 可选：标记被排除的 PMID
@@ -135,12 +140,18 @@ def main():
     # 初始化数据库
     init_db(DB_PATH)
 
+    # 步骤选择：--export / --export-since 若未搭配 --validate，视为"仅导出"模式，
+    # 不执行默认的 1-3 步。此前这段判断只体现在日志里而未用于控制流程，
+    # 导致 --export-since（文档定义为"仅增量导出"）仍会先跑下载/解析/硬过滤。
+    export_only = bool(args.export or args.export_since) and not args.validate
+
     logger.info("=" * 60)
     logger.info("增量更新流水线启动")
     logger.info(f"数据库: {DB_PATH}")
     logger.info(f"参数: query={args.query}, year_min={args.year_min}, year_max={args.year_max}")
-    logger.info(f"模式: 默认步骤(1-3)={'是' if not (args.validate or args.export or args.export_since) else '否'}, "
-                f"validate={'是' if args.validate else '否'}, export={'是' if args.export or args.export_since else '否'}")
+    logger.info(f"模式: {'仅导出（跳过步骤 1-3）' if export_only else '默认步骤(1-3)=是'}, "
+                f"validate={'是' if args.validate else '否'}, "
+                f"export={'是' if args.export or args.export_since else '否'}")
     logger.info(f"跳过: download={args.skip_download}, parse={args.skip_parse}, filter={args.skip_filter}")
     logger.info("=" * 60)
 
@@ -150,7 +161,11 @@ def main():
 
     # 1. 增量下载（默认步骤 1）
     new_xml_files = []
-    if not args.skip_download:
+    if args.skip_download:
+        logger.info("跳过下载阶段")
+    elif export_only:
+        logger.info("仅导出模式，跳过下载阶段")
+    else:
         new_xml_files = run_incremental_download(
             new_query=args.query,
             new_year_min=args.year_min,
@@ -158,24 +173,26 @@ def main():
         )
         if not new_xml_files:
             logger.info("无新增 PMID 下载，检查后续是否有增量数据...")
-    else:
-        logger.info("跳过下载阶段")
 
     # 2. 解析 XML -> SQLite（默认步骤 2）
-    if not args.skip_parse:
+    if args.skip_parse:
+        logger.info("跳过解析阶段")
+    elif export_only:
+        logger.info("仅导出模式，跳过解析阶段")
+    else:
         logger.info("开始解析 XML...")
         run_parse(xml_dir=RAW_XML_DIR, db_path=DB_PATH)
         logger.info("解析完成")
-    else:
-        logger.info("跳过解析阶段")
 
     # 3. 增量硬过滤（默认步骤 3）
-    if not args.skip_filter:
+    if args.skip_filter:
+        logger.info("跳过硬过滤阶段")
+    elif export_only:
+        logger.info("仅导出模式，跳过硬过滤阶段")
+    else:
         logger.info("开始增量硬过滤...")
         run_incremental_hard_filter(DB_PATH)
         logger.info("硬过滤完成")
-    else:
-        logger.info("跳过硬过滤阶段")
 
     # 4. 可选：标记被查询词排除的旧 PMID
     if args.mark_removed:

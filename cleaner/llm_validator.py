@@ -1479,14 +1479,25 @@ def _export_raw_csv(db_path: Path = DB_PATH) -> Path | None:
     return csv_path
 
 
+def _count_exportable(db_path: Path = DB_PATH) -> int:
+    """统计当前可导出的复核通过文献总数（用于识别"时间戳过早导致全量导出"）"""
+    with get_conn(db_path) as conn:
+        return conn.execute(f"""
+            SELECT COUNT(1)
+            FROM articles a
+            JOIN llm_validation v ON a.pmid = v.pmid
+            WHERE {_REVIEW_PASS_PREDICATE}
+        """).fetchone()[0]
+
+
 def export_incremental_raw_csv(since_timestamp: str = None, db_path: Path = DB_PATH) -> Path | None:
     """
     增量导出：导出指定时间后新增的、复核通过的文献原始信息。
 
     Args:
-        since_timestamp: ISO 格式时间字符串，如 '2025-08-01T00:00:00'。
+        since_timestamp: ISO 格式时间字符串，如 '2026-08-09T00:00:00'。
                          仅导出 validated_at > since_timestamp 的记录。
-                         None 则导出所有（等同于 _export_raw_csv）。
+                         该时间戳必须晚于上一次验证时间，否则会导出全部历史文献。
         db_path: 数据库路径
 
     Returns:
@@ -1497,6 +1508,16 @@ def export_incremental_raw_csv(since_timestamp: str = None, db_path: Path = DB_P
     if not rows:
         logger.info(f"增量导出: 无新增符合条件的记录 (since={since_timestamp})")
         return None
+
+    # 告警：若时间戳早于全部验证时间，导出结果等于全量，并非真正的增量导出
+    if since_timestamp:
+        total = _count_exportable(db_path)
+        if len(rows) >= total:
+            logger.warning(
+                f"增量导出条数 {len(rows)} 等于可导出总数 {total}："
+                f"时间戳 {since_timestamp} 早于全部文献的验证时间，"
+                f"本次并非真正的增量导出。请改用晚于上次验证时间的时间戳。"
+            )
 
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)

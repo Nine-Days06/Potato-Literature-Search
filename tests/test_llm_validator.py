@@ -625,6 +625,44 @@ class TestIncrementalRawCsv(unittest.TestCase):
         by_pmid = {r["pmid"]: r for r in rows}
         self.assertEqual(by_pmid["1"]["llm_reason"], "reason 1")
 
+    def test_should_warn_when_since_predates_all_validations(self):
+        """时间戳早于全部验证时间时导出=全量，必须显式告警而非静默"""
+        self._seed([
+            ("1", "2026-08-08T00:00:00", "RELEVANT", "Y"),
+            ("2", "2026-08-08T00:00:00", "RELEVANT", "Y"),
+        ])
+        with self.assertLogs("llm_validator", level="WARNING") as logs:
+            path = self._export("2025-08-01T00:00:00")
+
+        self.assertIsNotNone(path)
+        _, rows = self._read(path)
+        self.assertEqual(len(rows), 2, "时间戳过早时确实会导出全部")
+        warned = [ln for ln in logs.output if "并非真正的增量导出" in ln]
+        self.assertTrue(warned, f"应告警时间戳过早，实际日志: {logs.output}")
+
+    def test_should_not_warn_when_since_narrows_results(self):
+        """真正的增量导出（条数小于总数）不应误报"""
+        self._seed([
+            ("1", "2026-08-08T00:00:00", "RELEVANT", "Y"),
+            ("2", "2026-08-08T00:00:00", "RELEVANT", "Y"),
+            ("3", "2026-10-01T00:00:00", "RELEVANT", "Y"),
+        ])
+        import cleaner.llm_validator as mod
+        orig = mod.OUTPUT_DIR
+        mod.OUTPUT_DIR = self.temp_dir
+        try:
+            with self.assertLogs("llm_validator", level="INFO") as logs:
+                path = mod.export_incremental_raw_csv(
+                    "2026-09-01T00:00:00", db_path=self.db_path)
+        finally:
+            mod.OUTPUT_DIR = orig
+
+        self.assertIsNotNone(path)
+        _, rows = self._read(path)
+        self.assertEqual([r["pmid"] for r in rows], ["3"])
+        self.assertFalse([ln for ln in logs.output if "并非真正的增量导出" in ln],
+                         "条数已收窄，不应告警")
+
 
 if __name__ == "__main__":
     unittest.main()
