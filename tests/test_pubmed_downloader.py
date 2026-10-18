@@ -1,38 +1,150 @@
 import unittest
+from datetime import date, timedelta
 from unittest.mock import Mock, patch
 
 import requests
 
 from config.settings import SEARCH_YEAR_MIN, SEARCH_YEAR_MAX
-from downloader.pubmed_downloader import fetch_pmid_list, _get, _post
+from downloader.pubmed_downloader import (
+    fetch_pmid_list, _get, _post,
+    SAFE_LEAF_COUNT, _split_date_range, _esearch_count,
+)
+
+
+def _esearch_json(count: str, webenv: str = "test_webenv", querykey: str = "1") -> dict:
+    return {"esearchresult": {"count": count, "webenv": webenv, "querykey": querykey}}
 
 
 class TestPubmedDownloaderDateRange(unittest.TestCase):
+    """安全命中（不触发递归细分）时，主 esearch 走 POST 且带正确日期参数"""
+
     @patch("downloader.pubmed_downloader.time.sleep")
     @patch("downloader.pubmed_downloader._safe_json")
     @patch("downloader.pubmed_downloader._get")
-    def test_esearch_should_include_2020_to_now_date_range(self, mock_get, mock_safe_json, _mock_sleep):
-        mock_safe_json.return_value = {
-            "esearchresult": {
-                "count": "2",
-                "webenv": "test_webenv",
-                "querykey": "1",
-            }
-        }
-
+    @patch("downloader.pubmed_downloader._post")
+    def test_esearch_should_include_full_date_range_via_post(self, mock_post, mock_get, mock_safe_json, _mock_sleep):
+        # 全局年份范围被 5 年初分段；mock 探数返回 2、叶子取数返回 2，
+        # 所有 esearch 都返回同一份小结果
+        mock_safe_json.return_value = _esearch_json("2")
         esearch_resp = Mock()
         efetch_resp = Mock()
         efetch_resp.text = "1\n2\n"
-        mock_get.side_effect = [esearch_resp, efetch_resp]
+        mock_post.return_value = esearch_resp
+        mock_get.return_value = efetch_resp
 
         pmids = fetch_pmid_list("potato")
 
         self.assertEqual(pmids, ["1", "2"])
-        first_call_args, _ = mock_get.call_args_list[0]
-        params = first_call_args[1]
+        first_args, _ = mock_post.call_args_list[0]
+        params = first_args[1]
+        self.assertEqual(params["db"], "pubmed")
+        self.assertEqual(params["retmax"], 0)
         self.assertEqual(params["datetype"], "pdat")
-        self.assertEqual(params["mindate"], str(SEARCH_YEAR_MIN))
-        self.assertEqual(params["maxdate"], str(SEARCH_YEAR_MAX))
+        self.assertEqual(params["mindate"], f"{SEARCH_YEAR_MIN}-01-01")
+        all_maxdates = [
+            c[0][1]["maxdate"] for c in mock_post.call_args_list
+        ]
+        self.assertIn(f"{SEARCH_YEAR_MAX}-12-31", all_maxdates)
+
+
+class TestAdaptiveSlicing(unittest.TestCase):
+    """自适应切分：超限对半递归、单日降级、去重（技术报告 §8）"""
+
+    def test_split_range_returns_exclusive_adjacent_halves(self):
+        lo, hi = date(2024, 1, 1), date(2024, 12, 31)
+        left, right = _split_date_range(lo, hi)
+        self.assertEqual(left[0], date(2024, 1, 1))
+        self.assertEqual(left[1], date(2024, 7, 1))
+        self.assertEqual(right[0], date(2024, 7, 2))
+        self.assertEqual(right[1], date(2024, 12, 31))
+        self.assertEqual(left[1] + timedelta(days=1), right[0])
+
+    def test_split_range_single_day_returns_none(self):
+        d = date(2024, 5, 1)
+        self.assertIsNone(_split_date_range(d, d))
+
+    @patch("downloader.pubmed_downloader._fetch_page_by_date")
+    @patch("downloader.pubmed_downloader._esearch_count")
+    def test_over_limit_range_is_bisected(self, mock_count, mock_fetch):
+        """命中 [12000, 6000, 6000]：根段超限对半拆，两个叶子各自取全"""
+        mock_count.side_effect = [12000, 6000, 6000]
+        mock_fetch.side_effect = [["1"], ["2"]]
+
+        from downloader.pubmed_downloader import _collect_range
+        pmids = _collect_range("q", date(2024, 1, 1), date(2024, 12, 31))
+
+        self.assertEqual(pmids, ["1", "2"])
+        self.assertEqual(mock_count.call_count, 3)
+        # 两次取数调用的日期区间互斥相邻
+        first_range = mock_fetch.call_args_list[0][0][1:]
+        second_range = mock_fetch.call_args_list[1][0][1:]
+        self.assertLess(first_range[1], second_range[0])
+
+    @patch("downloader.pubmed_downloader._fetch_page_by_date")
+    @patch("downloader.pubmed_downloader._esearch_count")
+    def test_exactly_safe_count_is_leaf(self, mock_count, mock_fetch):
+        """命中恰好 9500：不拆分，直接翻页取全"""
+        mock_count.return_value = SAFE_LEAF_COUNT
+        mock_fetch.return_value = ["1"]
+
+        from downloader.pubmed_downloader import _collect_range
+        pmids = _collect_range("q", date(2024, 1, 1), date(2024, 12, 31))
+
+        self.assertEqual(pmids, ["1"])
+        mock_count.assert_called_once()
+        mock_fetch.assert_called_once()
+
+    @patch("downloader.pubmed_downloader.logger")
+    @patch("downloader.pubmed_downloader._fetch_page_by_date")
+    @patch("downloader.pubmed_downloader._esearch_count")
+    def test_single_day_over_limit_degrades_without_recursion(self, mock_count, mock_fetch, mock_logger):
+        """递归到单日仍超限：降级直接取全 + 告警，不死循环"""
+        mock_count.return_value = 99000
+        mock_fetch.return_value = ["1"]
+
+        from downloader.pubmed_downloader import _collect_range
+        pmids = _collect_range("q", date(2024, 5, 1), date(2024, 5, 1))
+
+        self.assertEqual(pmids, ["1"])
+        self.assertEqual(mock_count.call_count, 1)   # 未继续递归探数
+        mock_fetch.assert_called_once()
+        mock_logger.warning.assert_called()
+
+    @patch("downloader.pubmed_downloader.time.sleep")
+    @patch("downloader.pubmed_downloader._safe_json")
+    @patch("downloader.pubmed_downloader._get")
+    @patch("downloader.pubmed_downloader._post")
+    def test_slices_are_deduped_preserving_order(self, mock_post, mock_get, mock_safe_json, _mock_sleep):
+        """不同切片返回重叠 PMID 时保序去重"""
+        mock_safe_json.return_value = _esearch_json("1")
+        efetch_resp = Mock()
+        efetch_resp.text = "7\n"
+        mock_get.return_value = efetch_resp
+
+        pmids = fetch_pmid_list("potato", mindate=2024, maxdate=2024)
+
+        self.assertEqual(pmids, ["7"])               # 跨切片重复仅保留一份
+
+
+class TestEsearchCount(unittest.TestCase):
+    """探数接口：retmax=0 且走 POST"""
+
+    @patch("downloader.pubmed_downloader._rate_limiter")
+    @patch("downloader.pubmed_downloader._safe_json")
+    @patch("downloader.pubmed_downloader._post")
+    def test_count_uses_post_and_retmax_zero(self, mock_post, mock_safe_json, _limiter):
+        resp = Mock()
+        mock_post.return_value = resp
+        mock_safe_json.return_value = _esearch_json("123")
+
+        count = _esearch_count("potato", "2024-01-01", "2024-12-31")
+
+        self.assertEqual(count, 123)
+        args, kwargs = mock_post.call_args
+        params = args[1]
+        self.assertEqual(params["retmax"], 0)
+        self.assertEqual(params["mindate"], "2024-01-01")
+        self.assertEqual(params["maxdate"], "2024-12-31")
 
 
 def _resp(status_code: int) -> Mock:

@@ -2,8 +2,8 @@
 """
 NCBI E-utilities 批量下载器
 流程：
-  1. esearch  — 用查询词检索，获取 WebEnv + QueryKey（服务器端缓存）
-  2. esearch  — 分页抓取全部 PMID 列表
+  1. esearch  — 按日期切片探数，命中超阈值时对半递归细分（年→月→日）
+  2. efetch   — 叶子切片内翻页取全 PMID，规避单查询 10k retstart 硬上限
   3. efetch   — 按批次下载 XML，保存到 raw_xml 目录
   4. 断点续传 — 已下载的批次自动跳过
 """
@@ -13,6 +13,7 @@ import time
 import json
 import threading
 import requests
+from datetime import date, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -113,6 +114,12 @@ def _safe_json(r: requests.Response) -> dict:
 
 # ── Step 1 & 2：esearch 获取 PMID 列表 ───────────────────────
 
+# NCBI retstart 硬上限 10000；叶子阈值留余量防切分期间新文献入库顶破
+SAFE_LEAF_COUNT = 9500
+PMID_PAGE_SIZE = 5000
+FETCH_HARD_LIMIT = 10000
+
+
 def _generate_year_slices(slice_size: int = 5) -> list[tuple[int, int]]:
     """将全局年份范围按 slice_size 切分为多个子区间"""
     slices = []
@@ -124,78 +131,155 @@ def _generate_year_slices(slice_size: int = 5) -> list[tuple[int, int]]:
     return slices
 
 
-def fetch_pmid_list(query: str = PUBMED_QUERY,
-                    mindate: int | None = None,
-                    maxdate: int | None = None) -> list[str]:
-    """
-    通过 esearch + efetch 获取全部匹配的 PMID。
-    注意：esearch 的 retstart 限制为 9999，
-    超过 10000 条需利用 WebEnv + efetch(rettype='uilist') 获取。
-    """
-    logger.info("开始 esearch，获取 WebEnv ...")
-    lo = mindate if mindate is not None else SEARCH_YEAR_MIN
-    hi = maxdate if maxdate is not None else SEARCH_YEAR_MAX
+def _year_range_to_dates(lo: int, hi: int) -> tuple[date, date]:
+    return date(lo, 1, 1), date(hi, 12, 31)
+
+
+def _split_date_range(lo: date, hi: date) -> tuple[tuple[date, date], tuple[date, date]] | None:
+    """对半拆分为互斥相邻两段；已细到单日返回 None 终止递归"""
+    if lo >= hi:
+        return None
+    mid = lo + (hi - lo) // 2
+    return (lo, mid), (mid + timedelta(days=1), hi)
+
+
+def _esearch_count(query: str, mindate: str, maxdate: str) -> int:
+    """只取命中总数（retmax=0，POST），供切分决策"""
     params = {
         **_base_params(),
         "db": "pubmed",
         "term": query,
         "datetype": "pdat",
-        "mindate": str(lo),
-        "maxdate": str(hi),
-        "usehistory": "y",
+        "mindate": mindate,
+        "maxdate": maxdate,
         "retmax": 0,
-        "rettype": "json",
         "retmode": "json",
     }
-    # 使用 POST 避免查询词过长导致 414 URI Too Long
+    _rate_limiter.wait()
     r = _post(f"{EUTILS_BASE}/esearch.fcgi", params)
     result = _safe_json(r)["esearchresult"]
-    
+    if "ERROR" in result:
+        logger.error(f"NCBI Search Error: {result['ERROR']}")
+        raise RuntimeError(result["ERROR"])
+    return int(result["count"])
+
+
+def _fetch_page_by_date(query: str, mindate: str, maxdate: str) -> list[str]:
+    """叶子切片内翻页取全 PMID（usehistory + efetch uilist，GET 不带 term）"""
+    params = {
+        **_base_params(),
+        "db": "pubmed",
+        "term": query,
+        "datetype": "pdat",
+        "mindate": mindate,
+        "maxdate": maxdate,
+        "usehistory": "y",
+        "retmax": 0,
+        "retmode": "json",
+    }
+    _rate_limiter.wait()
+    r = _post(f"{EUTILS_BASE}/esearch.fcgi", params)
+    result = _safe_json(r)["esearchresult"]
+
     if "ERROR" in result:
         logger.error(f"NCBI Search Error: {result['ERROR']}")
         raise RuntimeError(result["ERROR"])
 
-    total    = int(result["count"])
-    webenv   = result["webenv"]
+    total = int(result["count"])
+    webenv = result["webenv"]
     querykey = result["querykey"]
-    logger.info(f"共找到 {total} 篇文献（WebEnv={webenv[:20]}...）")
+    if total == 0:
+        return []
 
-    # 分页拉取 PMID
     pmids = []
-    # 使用 efetch (uilist) 拉取，绕过 esearch 的 10k 限制
-    # 注意：即便使用 efetch，PubMed 对于 retstart + retmax 也有 10,000 的硬限制
-    page_size = 5000 
-    for start in range(0, total, page_size):
-        if start >= 10000:
-            logger.warning(f"检测到结果数 ({total}) 超过 PubMed API 的 10,000 条分页限制。")
-            logger.warning("仅能获取前 10,000 条记录。如需更多，请尝试分年份搜索。")
+    for start in range(0, total, PMID_PAGE_SIZE):
+        if start >= FETCH_HARD_LIMIT:
+            logger.error(
+                f"触及 NCBI {FETCH_HARD_LIMIT} 条 retstart 硬限制 "
+                f"(mindate={mindate}, maxdate={maxdate}, total={total})，"
+                "切片未被正确细分，请检查递归切分逻辑"
+            )
             break
-            
         p = {
             **_base_params(),
             "db": "pubmed",
             "webenv": webenv,
             "query_key": querykey,
             "retstart": start,
-            "retmax": page_size,
+            "retmax": PMID_PAGE_SIZE,
             "rettype": "uilist",
             "retmode": "text",
         }
         try:
+            _rate_limiter.wait()
             batch_r = _get(f"{EUTILS_BASE}/efetch.fcgi", p)
-            # efetch (uilist) 返回纯文本，每行一个 PMID
             batch_ids = [line.strip() for line in batch_r.text.splitlines() if line.strip()]
             pmids.extend(batch_ids)
-            logger.info(f"  PMID 列表进度: {len(pmids)}/{total}")
+            logger.info(f"  PMID 翻页进度: {len(pmids)}/{total} ({mindate}~{maxdate})")
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 400:
-                logger.warning(f"分页请求失败 (retstart={start})，可能触发了 NCBI 的 10k 限制。停止获取 PMID。")
+            if e.response is not None and e.response.status_code == 400:
+                logger.warning(
+                    f"分页请求失败 (retstart={start})，可能触发 10k 限制，停止本切片翻页"
+                )
                 break
             raise
         time.sleep(REQUEST_INTERVAL)
 
-    logger.info(f"PMID 列表获取完毕，共 {len(pmids)} 条")
     return pmids
+
+
+def _collect_range(query: str, lo: date, hi: date, depth: int = 0) -> list[str]:
+    """日期区间内取全 PMID：≤阈值翻页取全，超阈值对半递归细分"""
+    count = _esearch_count(query, lo.isoformat(), hi.isoformat())
+    label = f"{lo.isoformat()}~{hi.isoformat()}"
+    indent = "  " * depth
+
+    if count <= SAFE_LEAF_COUNT:
+        logger.info(f"{indent}切片 {label}: {count} 篇（≤{SAFE_LEAF_COUNT}，直接取全）")
+        return _fetch_page_by_date(query, lo.isoformat(), hi.isoformat())
+
+    parts = _split_date_range(lo, hi)
+    if parts is None:
+        logger.warning(
+            f"{indent}切片 {label}: 单日命中 {count} 篇仍超 {SAFE_LEAF_COUNT}，"
+            "降级截断取前 10,000 条"
+        )
+        return _fetch_page_by_date(query, lo.isoformat(), hi.isoformat())
+
+    logger.info(f"{indent}切片 {label}: {count} 篇超阈值，对半细分")
+    left, right = parts
+    return (
+        _collect_range(query, *left, depth + 1)
+        + _collect_range(query, *right, depth + 1)
+    )
+
+
+def fetch_pmid_list(query: str = PUBMED_QUERY,
+                    mindate: int | None = None,
+                    maxdate: int | None = None) -> list[str]:
+    """
+    获取日期范围内匹配查询的全部 PMID。
+    5 年初分段 → 每段 retmax=0 探数 → 超 9500 对半递归 → 叶子内翻页取全，
+    规避 NCBI retstart 10000 硬上限导致的静默截断。
+    """
+    lo_year = mindate if mindate is not None else SEARCH_YEAR_MIN
+    hi_year = maxdate if maxdate is not None else SEARCH_YEAR_MAX
+    logger.info(f"开始获取 PMID（{lo_year}-{hi_year}，自适应日期切分）...")
+
+    slices = _generate_year_slices(SEARCH_SLICE_YEARS)
+    slices = [(lo, hi) for lo, hi in slices if not (hi < lo_year or lo > hi_year)]
+
+    all_pmids = []
+    for idx, (lo, hi) in enumerate(slices, 1):
+        logger.info(f"--- 年度切片 {idx}/{len(slices)}: {lo}-{hi} ---")
+        d_lo, d_hi = _year_range_to_dates(
+            max(lo, lo_year), min(hi, hi_year)
+        )
+        all_pmids.extend(_collect_range(query, d_lo, d_hi))
+
+    all_pmids = list(dict.fromkeys(all_pmids))
+    logger.info(f"PMID 列表获取完毕，去重后共 {len(all_pmids)} 条")
+    return all_pmids
 
 
 # ── Step 3：efetch 批量下载 XML ───────────────────────────────
@@ -294,18 +378,8 @@ def run_download(query: str = PUBMED_QUERY) -> list[Path]:
     logger.info(f"搜索词: {query[:80]}...")
     logger.info("=" * 60)
 
-    slices = _generate_year_slices(SEARCH_SLICE_YEARS)
-    logger.info(f"年份切片: {SEARCH_SLICE_YEARS} 年/段，共 {len(slices)} 段")
-
-    all_pmids = []
-    for idx, (lo, hi) in enumerate(slices, 1):
-        logger.info(f"--- 切片 {idx}/{len(slices)}: {lo}-{hi} ---")
-        pmids = fetch_pmid_list(query, mindate=lo, maxdate=hi)
-        all_pmids.extend(pmids)
-        logger.info(f"  切片累计: {len(all_pmids)} 篇")
-
-    all_pmids = list(dict.fromkeys(all_pmids))
-    logger.info(f"所有切片处理完毕，去重后共 {len(all_pmids)} 篇")
+    all_pmids = fetch_pmid_list(query)
+    logger.info(f"共 {len(all_pmids)} 篇待下载")
 
     xml_files = download_xml_batches(all_pmids)
     return xml_files

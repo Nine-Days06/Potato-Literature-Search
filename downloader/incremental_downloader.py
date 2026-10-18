@@ -13,10 +13,10 @@ from pathlib import Path
 from typing import Optional, List
 
 from config.settings import (
-    RAW_XML_DIR, PUBMED_QUERY, SEARCH_YEAR_MIN, SEARCH_YEAR_MAX, SEARCH_SLICE_YEARS, LOG_DIR
+    RAW_XML_DIR, PUBMED_QUERY, SEARCH_YEAR_MIN, SEARCH_YEAR_MAX, LOG_DIR
 )
 from downloader.pubmed_downloader import (
-    fetch_pmid_list, download_xml_batches, _generate_year_slices
+    fetch_pmid_list, download_xml_batches
 )
 from utils.logger import get_logger
 
@@ -56,35 +56,20 @@ def fetch_all_pmids_for_query(
     query: str,
     year_min: int,
     year_max: int,
-    slice_years: int = SEARCH_SLICE_YEARS
+    slice_years: int = None
 ) -> List[str]:
     """
-    按年份切片获取指定查询词的所有 PMID
+    获取指定查询词在年份范围内的所有 PMID（自适应日期切分，规避 10k 截断）
+    slice_years 已废弃，保留参数仅为兼容旧签名。
     """
-    all_pmids = []
-    slices = _generate_year_slices(slice_years)
-    # 过滤只在指定年份范围内的切片
-    slices = [(lo, hi) for lo, hi in slices if not (hi < year_min or lo > year_max)]
-    
-    logger.info(f"年份切片: {slice_years} 年/段, 共 {len(slices)} 段 ({year_min}-{year_max})")
-    
-    for idx, (lo, hi) in enumerate(slices, 1):
-        logger.info(f"--- 切片 {idx}/{len(slices)}: {lo}-{hi} ---")
-        pmids = fetch_pmid_list(query, mindate=lo, maxdate=hi)
-        all_pmids.extend(pmids)
-        logger.info(f"  切片累计: {len(all_pmids)} 篇")
-    
-    # 去重
-    unique_pmids = list(dict.fromkeys(all_pmids))
-    logger.info(f"去重后共 {len(unique_pmids)} 篇")
-    return unique_pmids
+    return fetch_pmid_list(query, mindate=year_min, maxdate=year_max)
 
 
 def run_incremental_download(
     new_query: Optional[str] = None,
     new_year_min: Optional[int] = None,
     new_year_max: Optional[int] = None,
-    slice_years: int = SEARCH_SLICE_YEARS
+    slice_years: int = None
 ) -> List[Path]:
     """
     执行增量下载
@@ -93,7 +78,7 @@ def run_incremental_download(
         new_query: 新搜索词，None 则使用配置文件默认值
         new_year_min: 新最小年份，None 则使用配置文件默认值
         new_year_max: 新最大年份，None 则使用配置文件默认值
-        slice_years: 年份切片大小
+        slice_years: 已废弃，保留仅为兼容旧签名
     
     Returns:
         新下载的 XML 批次文件路径列表
