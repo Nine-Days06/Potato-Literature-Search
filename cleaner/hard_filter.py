@@ -2,17 +2,27 @@
 """
 硬过滤模块
 逐条检查数据库中的文献，对不符合条件的记录打上过滤标记（写入 filter_log 表）。
-过滤规则（任一满足即过滤）：
-  1. 语言不是英文（language != 'eng'）
-  2. 摘要为空或过短（< ABSTRACT_MIN_LEN 字符）
-  3. 发表年份超出范围
-  4. 文章类型属于排除列表（Letter / Comment / Correction 等）
-  5. 标题为空
-  6. 疑似重复标题（同期刊同年份完全相同的标题）
+过滤规则（2026-10 放宽后仅剩两条机械性排除规则 + 一条转审规则）：
+  1. 标题为空                          → 排除
+  2. 疑似重复标题（同期刊同年份同标题） → 排除
+  3. 摘要为空                          → **不排除，转人工审核**（stage='needs_review'）
+
+摘要为空为什么不排除：这类文献多为 PubMed 早期（1940–1980 年代）无摘要字段的记录，
+或 Letter/简讯，其中确有马铃薯相关文献。模型只看标题判定不可靠，因此跳过 LLM、
+直接进人工复核队列，由人判断。
+
+已取消的规则（不要加回；这些维度改由 LLM 二次验证 + 研究方向分类承担）：
+  - 语言过滤（language != 'eng'）
+  - 摘要最小长度（原 ABSTRACT_MIN_LEN=80）
+  - 发表年份越界（原 PUB_YEAR_MIN / PUB_YEAR_MAX）
+  - 文章类型黑名单（原 EXCLUDED_ARTICLE_TYPES）
+  - 标题最小长度（原 < 10 字符）
+历史数据中由这些规则写下的 filter_log 记录需用 scripts/migrate_relax_hard_filter.py 清理后重跑。
 
 filter_log 记录约定（pmid 为主键，一篇文献至多一条）：
   - stage='hard_filter'       被硬过滤排除，reason 为排除原因
   - stage='hard_filter_pass'  通过硬过滤（含历史已验证文献回填）
+  - stage='needs_review'      机械规则通过但摘要为空，转人工审核（不进 LLM 验证）
   - stage='query_removed'     因查询词/年份变更被移除
 """
 
@@ -21,9 +31,6 @@ from pathlib import Path
 
 from config.settings import (
     DB_PATH,
-    ABSTRACT_MIN_LEN,
-    PUB_YEAR_MIN, PUB_YEAR_MAX,
-    EXCLUDED_ARTICLE_TYPES,
     LOG_DIR,
 )
 from utils import now_iso
@@ -46,59 +53,42 @@ VALUES (?, 'hard_filter_pass', ?, ?)
 """
 PASS_STAGE = "hard_filter_pass"
 
+# 转人工审核：摘要为空但其他机械规则通过。
+# 与 PASS_STAGE 区分开，才能让 LLM 验证跳过它们、复核清单单独挑出它们。
+REVIEW_STAGE = "needs_review"
+INSERT_REVIEW_SQL = """
+INSERT OR REPLACE INTO filter_log (pmid, stage, reason, filtered_at)
+VALUES (?, 'needs_review', ?, ?)
+"""
+
 
 # ── 单条规则函数 ──────────────────────────────────────────────
 
-def check_language(row: sqlite3.Row) -> str | None:
-    """非英文返回原因描述，否则 None"""
-    lang = (row["language"] or "").lower().strip()
-    # PubMed 英文记录标记为 'eng'；也接受空值（部分记录没有语言字段）
-    if lang and lang != "eng":
-        return f"language={lang}"
-    return None
-
-
-def check_abstract(row: sqlite3.Row) -> str | None:
+def check_abstract_empty(row: sqlite3.Row) -> str | None:
+    """摘要为空返回原因描述，否则 None（长度阈值已取消）"""
     abstract = (row["abstract"] or "").strip()
     if not abstract:
         return "abstract_empty"
-    if len(abstract) < ABSTRACT_MIN_LEN:
-        return f"abstract_too_short({len(abstract)}chars)"
     return None
 
 
-def check_year(row: sqlite3.Row) -> str | None:
-    year = row["pub_year"]
-    if year is None:
-        return "pub_year_missing"
-    if year < PUB_YEAR_MIN:
-        return f"pub_year_too_old({year})"
-    if year > PUB_YEAR_MAX:
-        return f"pub_year_future({year})"
-    return None
-
-
-def check_article_type(row: sqlite3.Row) -> str | None:
-    types = (row["article_types"] or "").lower()
-    for excl in EXCLUDED_ARTICLE_TYPES:
-        if excl.lower() in types:
-            return f"excluded_type({excl})"
-    return None
-
-
-def check_title(row: sqlite3.Row) -> str | None:
+def check_title_empty(row: sqlite3.Row) -> str | None:
+    """标题为空返回原因描述，否则 None（长度阈值已取消）"""
     title = (row["title"] or "").strip()
-    if not title or len(title) < 10:
-        return "title_empty_or_too_short"
+    if not title:
+        return "title_empty"
     return None
 
 
+# 排除规则：命中即 stage='hard_filter'，不再进入后续流程
 RULE_FUNCS = [
-    check_language,
-    check_abstract,
-    check_year,
-    check_article_type,
-    check_title,
+    check_title_empty,
+]
+
+# 转审规则：命中不排除，写 stage='needs_review'，由人工判定
+# （2026-10 起摘要为空不再丢弃；这些文献通常无摘要可给模型看，跳过 LLM）
+REVIEW_FUNCS = [
+    check_abstract_empty,
 ]
 
 
@@ -135,34 +125,68 @@ def find_duplicate_titles(db_path: Path = DB_PATH, conn: sqlite3.Connection = No
 
 # ── 单行判定与统计输出（全量 / 增量共用）─────────────────────
 
-def _evaluate_row(row, dup_pmids, reason_counts, filtered_pmids, log_rows, now) -> None:
-    """单行硬过滤判定：重复标题优先，其后 RULE_FUNCS 任一命中即停。
+class _FilterAccumulator:
+    """单轮硬过滤的累加器（全量 / 增量共用）
 
-    直接累加 reason_counts（按 '(' 前缀归一）、filtered_pmids、log_rows。
+    - reason_counts   排除原因 → 篇数（含转审原因，便于日志里同时看到）
+    - filtered_pmids  stage='hard_filter' 的 PMID
+    - review_pmids    stage='needs_review' 的 PMID（摘要为空，转人工）
+    - log_rows        待写入的排除记录
+    - review_rows     待写入的转审记录
+    """
+
+    def __init__(self):
+        self.reason_counts: dict[str, int] = {}
+        self.filtered_pmids: set[str] = set()
+        self.review_pmids: set[str] = set()
+        self.log_rows: list[tuple] = []
+        self.review_rows: list[tuple] = []
+
+
+def _bump(reason_counts: dict, reason: str) -> None:
+    """按 '(' 前缀归一后累加原因计数"""
+    reason_key = reason.split("(")[0]
+    reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
+
+
+def _evaluate_row(row, dup_pmids, acc: _FilterAccumulator, now) -> None:
+    """单行硬过滤判定：重复标题优先，其后 RULE_FUNCS 排除，最后 REVIEW_FUNCS 转审。
+
+    判定顺序保证"重复标题 > 标题空 > 摘要空转审"：
+    一篇既是重复标题又摘要为空的文献算 duplicate_title（真排除），
+    不会被转审队列重复收录。
     """
     pmid = row["pmid"]
     if pmid in dup_pmids:
-        reason = "duplicate_title"
-        reason_counts[reason] = reason_counts.get(reason, 0) + 1
-        filtered_pmids.add(pmid)
-        log_rows.append((pmid, reason, now))
+        _bump(acc.reason_counts, "duplicate_title")
+        acc.filtered_pmids.add(pmid)
+        acc.log_rows.append((pmid, "duplicate_title", now))
         return
 
     for rule_fn in RULE_FUNCS:
         reason = rule_fn(row)
         if reason:
-            reason_key = reason.split("(")[0]
-            reason_counts[reason_key] = reason_counts.get(reason_key, 0) + 1
-            filtered_pmids.add(pmid)
-            log_rows.append((pmid, reason, now))
-            break
+            _bump(acc.reason_counts, reason)
+            acc.filtered_pmids.add(pmid)
+            acc.log_rows.append((pmid, reason, now))
+            return
+
+    for rule_fn in REVIEW_FUNCS:
+        reason = rule_fn(row)
+        if reason:
+            _bump(acc.reason_counts, reason)
+            acc.review_pmids.add(pmid)
+            acc.review_rows.append((pmid, reason, now))
+            return
 
 
-def _log_reason_stats(reason_counts: dict) -> None:
+def _log_reason_stats(reason_counts: dict, review_pmids: set[str] | None = None) -> None:
     """输出过滤原因统计（两个入口共用）"""
     logger.info("过滤原因统计：")
     for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
         logger.info(f"  {reason:<40} {cnt:>6} 篇")
+    if review_pmids:
+        logger.info(f"其中摘要为空转人工审核 {len(review_pmids)} 篇（未排除，不进 LLM 验证）")
 
 
 # ── 主流程 ────────────────────────────────────────────────────
@@ -186,15 +210,13 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
         dup_pmids = find_duplicate_titles(db_path, conn=conn)
         logger.info(f"发现重复标题 {len(dup_pmids)} 篇")
 
-        reason_counts: dict[str, int] = {}
-        filtered_pmids: set[str] = set()
+        acc = _FilterAccumulator()
         seen_pmids: set[str] = set()
-        log_rows: list[tuple] = []
 
-        # 清理旧的过滤/通过标记（仅限硬过滤阶段，query_removed 等其他标记保留）
+        # 清理旧的过滤/通过/转审标记（仅限硬过滤阶段，query_removed 等其他标记保留）
         conn.execute(
-            "DELETE FROM filter_log WHERE stage IN ('hard_filter', ?)",
-            (PASS_STAGE,),
+            "DELETE FROM filter_log WHERE stage IN ('hard_filter', ?, ?)",
+            (PASS_STAGE, REVIEW_STAGE),
         )
 
         # 分批读取（避免全量加载到内存）
@@ -212,31 +234,37 @@ def run_hard_filter(db_path: Path = DB_PATH) -> dict:
 
             for row in rows:
                 seen_pmids.add(row["pmid"])
-                _evaluate_row(row, dup_pmids, reason_counts, filtered_pmids, log_rows, now)
+                _evaluate_row(row, dup_pmids, acc, now)
 
             offset += page_size
             if offset % 20000 == 0:
                 logger.info(f"  已扫描 {offset} / {total} ...")
 
         # 批量写入过滤日志
-        conn.executemany(INSERT_LOG_SQL, log_rows)
+        conn.executemany(INSERT_LOG_SQL, acc.log_rows)
+        conn.executemany(INSERT_REVIEW_SQL, acc.review_rows)
 
         # 通过的文献写入通过标记，供增量硬过滤识别已处理
+        # 转审文献单独标记，不算"通过"（它们还没被判过相关性）
         pass_rows = [
             (pmid, "passed", now)
-            for pmid in seen_pmids - filtered_pmids
+            for pmid in seen_pmids - acc.filtered_pmids - acc.review_pmids
         ]
         conn.executemany(INSERT_PASS_SQL, pass_rows)
 
-    passed = total - len(filtered_pmids)
-    logger.info(f"硬过滤完成：保留 {passed} 篇，过滤 {len(filtered_pmids)} 篇")
-    _log_reason_stats(reason_counts)
+    passed = total - len(acc.filtered_pmids) - len(acc.review_pmids)
+    logger.info(
+        f"硬过滤完成：保留 {passed} 篇，过滤 {len(acc.filtered_pmids)} 篇，"
+        f"转人工审核 {len(acc.review_pmids)} 篇"
+    )
+    _log_reason_stats(acc.reason_counts, acc.review_pmids)
 
     return {
         "total": total,
-        "filtered": len(filtered_pmids),
+        "filtered": len(acc.filtered_pmids),
         "passed": passed,
-        "reason_counts": reason_counts,
+        "review": len(acc.review_pmids),
+        "reason_counts": acc.reason_counts,
     }
 
 
@@ -288,7 +316,7 @@ def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
     if not rows:
         logger.info("无新增 PMID 需要硬过滤")
         return {
-            "total": 0, "filtered": 0, "passed": 0,
+            "total": 0, "filtered": 0, "passed": 0, "review": 0,
             "reason_counts": {}, "backfilled": backfilled,
         }
 
@@ -304,32 +332,40 @@ def run_incremental_hard_filter(db_path: Path = DB_PATH) -> dict:
     new_dup_pmids = dup_pmids & new_pmids
     logger.info(f"其中新增 PMID 重复: {len(new_dup_pmids)} 篇")
 
-    reason_counts: dict[str, int] = {}
-    filtered_pmids: set[str] = set()
-    log_rows: list[tuple] = []
+    acc = _FilterAccumulator()
 
     for row in rows:
-        _evaluate_row(row, new_dup_pmids, reason_counts, filtered_pmids, log_rows, now)
+        _evaluate_row(row, new_dup_pmids, acc, now)
 
     # 批量写入过滤日志（追加模式，不删除旧记录）
-    # 通过的文献写入通过标记，下次增量运行不再重复处理
-    pass_rows = [(pmid, "passed", now) for pmid in new_pmids - filtered_pmids]
-    if log_rows or pass_rows:
+    # 通过的文献写入通过标记，下次增量运行不再重复处理；
+    # 摘要为空的写 needs_review，下次增量同样不再重复处理，但不进 LLM 验证。
+    pass_rows = [
+        (pmid, "passed", now)
+        for pmid in new_pmids - acc.filtered_pmids - acc.review_pmids
+    ]
+    if acc.log_rows or acc.review_rows or pass_rows:
         with get_conn(db_path) as conn:
-            if log_rows:
-                conn.executemany(INSERT_LOG_SQL, log_rows)
+            if acc.log_rows:
+                conn.executemany(INSERT_LOG_SQL, acc.log_rows)
+            if acc.review_rows:
+                conn.executemany(INSERT_REVIEW_SQL, acc.review_rows)
             if pass_rows:
                 conn.executemany(INSERT_PASS_SQL, pass_rows)
 
-    passed = len(rows) - len(filtered_pmids)
-    logger.info(f"增量硬过滤完成：保留 {passed} 篇，过滤 {len(filtered_pmids)} 篇")
-    _log_reason_stats(reason_counts)
+    passed = len(rows) - len(acc.filtered_pmids) - len(acc.review_pmids)
+    logger.info(
+        f"增量硬过滤完成：保留 {passed} 篇，过滤 {len(acc.filtered_pmids)} 篇，"
+        f"转人工审核 {len(acc.review_pmids)} 篇"
+    )
+    _log_reason_stats(acc.reason_counts, acc.review_pmids)
 
     return {
         "total": len(rows),
-        "filtered": len(filtered_pmids),
+        "filtered": len(acc.filtered_pmids),
         "passed": passed,
-        "reason_counts": reason_counts,
+        "review": len(acc.review_pmids),
+        "reason_counts": acc.reason_counts,
         "backfilled": backfilled,
     }
 

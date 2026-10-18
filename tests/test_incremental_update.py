@@ -42,6 +42,8 @@ class TestStageSelection(unittest.TestCase):
              patch.object(iu, "run_validation", side_effect=rec("validate")), \
              patch.object(iu, "export_incremental_raw_csv",
                           side_effect=rec("export", Path("out.csv"))), \
+             patch.object(iu, "export_incremental_filtered_csv",
+                          side_effect=rec("export_filtered", Path("out_filtered.csv"))), \
              patch.object(iu, "get_removed_pmids", side_effect=rec("removed", set())), \
              patch.object(iu, "mark_removed_pmids"):
             iu.main()
@@ -97,12 +99,16 @@ class TestStageSelection(unittest.TestCase):
         self.assertTrue(calls.get("validate"))
 
     def test_export_since_passes_timestamp_through(self):
-        """时间戳必须原样传给导出函数"""
+        """时间戳必须原样传给两个导出函数（raw 与 filtered 同时段）"""
         seen = {}
 
         def fake_export(since=None, db_path=None):
             seen["since"] = since
             return Path("out.csv")
+
+        def fake_export_filtered(since=None, db_path=None):
+            seen["since_filtered"] = since
+            return Path("out_filtered.csv")
 
         with patch.object(sys, "argv", ["incremental_update.py",
                                         "--export-since", "2025-08-01T00:00:00"]), \
@@ -110,10 +116,19 @@ class TestStageSelection(unittest.TestCase):
              patch.object(iu, "run_incremental_download", return_value=[]), \
              patch.object(iu, "run_parse"), \
              patch.object(iu, "run_incremental_hard_filter"), \
-             patch.object(iu, "export_incremental_raw_csv", side_effect=fake_export):
+             patch.object(iu, "export_incremental_raw_csv", side_effect=fake_export), \
+             patch.object(iu, "export_incremental_filtered_csv",
+                          side_effect=fake_export_filtered):
             iu.main()
 
         self.assertEqual(seen.get("since"), "2025-08-01T00:00:00")
+        self.assertEqual(seen.get("since_filtered"), "2025-08-01T00:00:00")
+
+    def test_export_emits_both_raw_and_filtered(self):
+        """--export 必须同时产出 raw 与带研究方向的 filtered 两份"""
+        calls = self._run(["--export"])
+        self.assertTrue(calls.get("export"))
+        self.assertTrue(calls.get("export_filtered"))
 
 
 if __name__ == "__main__":

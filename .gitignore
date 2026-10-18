@@ -22,3 +22,6 @@ docs/
 
 # OpenCode
 .omo/
+
+# 提示词基准测试输出（可由 bench_run.py 重新生成）
+bench_out/

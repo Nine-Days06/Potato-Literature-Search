@@ -13,12 +13,81 @@ from cleaner.llm_validator import (
     _build_log_rows,
     _count_verdicts,
     _normalize_verdict,
+    _normalize_research_field,
     _export_raw_csv,
     _export_filtered_csv,
     export_incremental_raw_csv,
+    export_incremental_filtered_csv,
     RAW_EXPORT_FIELDS,
+    FILTERED_EXPORT_FIELDS,
+    REVIEW_PENDING_FIELDS,
+    NEEDS_REVIEW_VERDICT,
 )
+from config.settings import RESEARCH_FIELDS, DEFAULT_RESEARCH_FIELD
 from utils.db import init_db, get_conn
+
+
+class TestResearchFieldSettings(unittest.TestCase):
+    """研究方向枚举的封闭性约束（LLM 只能二选一，不得自造标签）"""
+
+    def test_enum_is_closed_and_unique(self):
+        self.assertTrue(RESEARCH_FIELDS)
+        self.assertEqual(len(RESEARCH_FIELDS), len(set(RESEARCH_FIELDS)))
+
+    def test_default_is_member(self):
+        self.assertIn(DEFAULT_RESEARCH_FIELD, RESEARCH_FIELDS)
+
+    def test_prompt_lists_every_field(self):
+        """系统提示词必须把全部枚举标签交给模型，否则分类不可控"""
+        from cleaner.llm_validator import SYSTEM_PROMPT
+        for field in RESEARCH_FIELDS:
+            self.assertIn(field, SYSTEM_PROMPT)
+        prompt = _build_per_article_prompt("1", "t", "a")
+        self.assertIn("research_field", prompt)
+
+
+class TestPromptRules(unittest.TestCase):
+    """提示词的关键规则块（经 300 篇基准集 × 双模型 × 3 次投票选定）
+
+    选型为 bench_prompts.py 的 V3_CHECK，生产 SYSTEM_PROMPT 与之逐字一致。
+    配对口径金标准准确率：glm 168/170 = 0.9882，deepseek 179/180 = 0.9944。
+    这几条断言用于防止后续改动误删关键规则块。
+    """
+
+    def setUp(self):
+        from cleaner.llm_validator import SYSTEM_PROMPT
+        self.prompt = SYSTEM_PROMPT
+
+    def test_mentions_core_question(self):
+        self.assertIn("Solanum tuberosum", self.prompt)
+        self.assertIn("研究对象", self.prompt)
+
+    def test_warns_sweet_potato_is_not_potato(self):
+        """甘薯混淆是实测中最顽固的错误，负例规则必须保留"""
+        self.assertIn("Ipomoea batatas", self.prompt)
+        self.assertIn("sweet potato", self.prompt.lower())
+
+    def test_mentions_passing_reference_rule(self):
+        self.assertIn("顺带提及", self.prompt)
+
+    def test_has_self_check_step(self):
+        self.assertIn("自检", self.prompt)
+        self.assertIn("Q1", self.prompt)
+        self.assertIn("Q2", self.prompt)
+
+    def test_no_few_shot_examples(self):
+        """示例已按用户要求删除，不应回退"""
+        self.assertNotIn("示例1", self.prompt)
+        self.assertNotIn("示例 1", self.prompt)
+
+    def test_no_strict_default_block(self):
+        """「默认倾向排除」会漏收边缘正例（V6 在 pathogen 层漏掉 32719659），不启用"""
+        self.assertNotIn("默认倾向", self.prompt)
+        self.assertNotIn("宁可漏收", self.prompt)
+
+    def test_species_guard_not_reintroduced(self):
+        """物种甄别块在 deepseek 上会多误排正例（31277248），已按基准数据移除"""
+        self.assertNotIn("物种甄别", self.prompt)
 
 
 class TestExtractJsonMultiArray(unittest.TestCase):
@@ -94,6 +163,7 @@ class TestBuildPerArticlePrompt(unittest.TestCase):
         self.assertIn('"pmid":', prompt)
         self.assertIn('"verdict":', prompt)
         self.assertIn('"reason":', prompt)
+        self.assertIn('"research_field":', prompt)
 
     def test_prompt_handles_empty_fields(self):
         prompt = _build_per_article_prompt("1", "", "")
@@ -175,9 +245,16 @@ class TestBuildJsonl(unittest.TestCase):
 
 
 class TestParseBatchResults(unittest.TestCase):
+    """解析 batch 结果 JSONL 并写库。
+
+    注意：`_parse_batch_results` 会真实写库，因此必须注入临时库
+    （`db_path` 参数），否则测试数据会污染生产库。
+    """
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test.db")
+        init_db(self.db_path)
 
     def tearDown(self):
         import shutil
@@ -208,7 +285,7 @@ class TestParseBatchResults(unittest.TestCase):
         }
         path = self._make_result_jsonl([result_line])
         from cleaner.llm_validator import _parse_batch_results as parser
-        success, failed = parser(path)
+        success, failed = parser(path, self.db_path)
         self.assertEqual(success, 1)
         self.assertEqual(len(failed), 0)
 
@@ -228,7 +305,7 @@ class TestParseBatchResults(unittest.TestCase):
         }
         path = self._make_result_jsonl([result_line])
         from cleaner.llm_validator import _parse_batch_results as parser
-        success, failed = parser(path)
+        success, failed = parser(path, self.db_path)
         self.assertEqual(success, 1, "markdown 包裹的单 JSON 对象应能成功解析")
         self.assertEqual(len(failed), 0)
 
@@ -239,7 +316,7 @@ class TestParseBatchResults(unittest.TestCase):
         }
         path = self._make_result_jsonl([result_line])
         from cleaner.llm_validator import _parse_batch_results as parser
-        success, failed = parser(path)
+        success, failed = parser(path, self.db_path)
         self.assertEqual(success, 0)
         self.assertEqual(len(failed), 1)
 
@@ -248,7 +325,7 @@ class TestParseBatchResults(unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write("this is not json\n")
         from cleaner.llm_validator import _parse_batch_results as parser
-        success, failed = parser(path)
+        success, failed = parser(path, self.db_path)
         self.assertEqual(success, 0)
 
     def test_parse_mixed_results(self):
@@ -266,7 +343,7 @@ class TestParseBatchResults(unittest.TestCase):
         }
         path = self._make_result_jsonl([ok, err])
         from cleaner.llm_validator import _parse_batch_results as parser
-        success, failed = parser(path)
+        success, failed = parser(path, self.db_path)
         self.assertEqual(success, 1)
         self.assertEqual(len(failed), 1)
         self.assertEqual(failed[0], "ERR1")
@@ -286,13 +363,13 @@ class TestParseBatchResults(unittest.TestCase):
             }
             path = self._make_result_jsonl([item])
             from cleaner.llm_validator import _parse_batch_results as parser
-            success, failed = parser(path)
+            success, failed = parser(path, self.db_path)
             self.assertEqual(success, 0, content)
             self.assertEqual(len(failed), 1, content)
 
 
 class TestBuildLogRows(unittest.TestCase):
-    """回归测试：SQL 查询不再返回 label 列，log_rows 必须为 4 元组"""
+    """回归测试：SQL 查询不再返回 label 列，log_rows 必须为 5 元组（末位为 research_field）"""
 
     def _make_sql_rows(self, pmids: list[str]):
         """模拟同步验证的查询结果（仅 pmid/title/abstract 三列）"""
@@ -308,15 +385,19 @@ class TestBuildLogRows(unittest.TestCase):
     def test_rows_without_label_column(self):
         batch = self._make_sql_rows(["1", "2"])
         pmid_to_result = {
-            "1": {"pmid": "1", "verdict": "RELEVANT", "reason": "r1"},
-            "2": {"pmid": "2", "verdict": "NOT_RELEVANT", "reason": "r2"},
+            "1": {"pmid": "1", "verdict": "RELEVANT", "reason": "r1",
+                  "research_field": "遗传育种"},
+            "2": {"pmid": "2", "verdict": "NOT_RELEVANT", "reason": "r2",
+                  "research_field": "遗传育种"},
         }
         log_rows, failed = _build_log_rows(batch, pmid_to_result, set(), "now")
         self.assertEqual(len(log_rows), 2)
         self.assertEqual(failed, [])
         for row in log_rows:
-            self.assertEqual(len(row), 4)
-        self.assertEqual(log_rows[0], ("1", "RELEVANT", "r1", "now"))
+            self.assertEqual(len(row), 5)
+        self.assertEqual(log_rows[0], ("1", "RELEVANT", "r1", "now", "遗传育种"))
+        # NOT_RELEVANT 不分类：即使模型给了方向也清空
+        self.assertEqual(log_rows[1], ("2", "NOT_RELEVANT", "r2", "now", ""))
 
     def test_failed_pmids_are_collected(self):
         batch = self._make_sql_rows(["1", "2", "3"])
@@ -369,14 +450,47 @@ class TestNormalizeVerdict(unittest.TestCase):
         self.assertIsNone(_normalize_verdict(None))
 
 
-class TestCountVerdicts(unittest.TestCase):
-    """回归测试：log_rows 为 4 元组，统计解包不能按 5 元组"""
+class TestNormalizeResearchField(unittest.TestCase):
+    """方向归一化：NOT_RELEVANT 不分类；越界/缺失/非字符串回退 DEFAULT_RESEARCH_FIELD"""
 
-    def test_counts_four_tuple_rows(self):
+    def test_not_relevant_never_classified(self):
+        self.assertEqual(_normalize_research_field("遗传育种", "NOT_RELEVANT"), "")
+        self.assertEqual(_normalize_research_field("", "NOT_RELEVANT"), "")
+        self.assertEqual(_normalize_research_field(None, "NOT_RELEVANT"), "")
+
+    def test_valid_field_kept(self):
+        for field in RESEARCH_FIELDS:
+            self.assertEqual(_normalize_research_field(field, "RELEVANT"), field)
+
+    def test_whitespace_stripped(self):
+        self.assertEqual(_normalize_research_field("  栽培生理 \n", "RELEVANT"), "栽培生理")
+
+    def test_out_of_enum_falls_back(self):
+        # 模型自造标签不应导致整篇回退重试，收敛到兜底值
+        self.assertEqual(
+            _normalize_research_field("植物病理学", "RELEVANT"),
+            DEFAULT_RESEARCH_FIELD,
+        )
+        self.assertEqual(
+            _normalize_research_field("分子生物学与遗传学", "RELEVANT"),
+            DEFAULT_RESEARCH_FIELD,
+        )
+
+    def test_missing_or_wrong_type_falls_back(self):
+        self.assertEqual(_normalize_research_field(None, "RELEVANT"), DEFAULT_RESEARCH_FIELD)
+        self.assertEqual(_normalize_research_field("", "RELEVANT"), DEFAULT_RESEARCH_FIELD)
+        self.assertEqual(_normalize_research_field(["遗传育种"], "RELEVANT"), DEFAULT_RESEARCH_FIELD)
+        self.assertEqual(_normalize_research_field(123, "RELEVANT"), DEFAULT_RESEARCH_FIELD)
+
+
+class TestCountVerdicts(unittest.TestCase):
+    """回归测试：log_rows 为 5 元组，统计解包不能按 4 元组"""
+
+    def test_counts_five_tuple_rows(self):
         rows = [
-            ("1", "RELEVANT", "r1", "now"),
-            ("2", "NOT_RELEVANT", "r2", "now"),
-            ("3", "RELEVANT", "r3", "now"),
+            ("1", "RELEVANT", "r1", "now", "遗传育种"),
+            ("2", "NOT_RELEVANT", "r2", "now", ""),
+            ("3", "RELEVANT", "r3", "now", "栽培生理"),
         ]
         self.assertEqual(
             _count_verdicts(rows),
@@ -616,7 +730,10 @@ class TestIncrementalRawCsv(unittest.TestCase):
 
         fieldnames, rows = self._read(path)
         self.assertEqual(sorted(r["pmid"] for r in rows), ["1", "2"])
-        self.assertEqual(fieldnames[-3:], ["llm_verdict", "llm_reason", "human_review"])
+        self.assertEqual(
+            fieldnames[-4:],
+            ["llm_verdict", "llm_reason", "research_field", "human_review"],
+        )
         self.assertNotIn("reason", fieldnames)
         # 过滤导出不含 raw 专属列
         for col in ("pub_month", "journal_abbr"):
@@ -662,6 +779,322 @@ class TestIncrementalRawCsv(unittest.TestCase):
         self.assertEqual([r["pmid"] for r in rows], ["3"])
         self.assertFalse([ln for ln in logs.output if "并非真正的增量导出" in ln],
                          "条数已收窄，不应告警")
+
+
+class TestIncrementalFilteredCsv(unittest.TestCase):
+    """export_incremental_filtered_csv：与 raw 增量同筛选/同时段，但带研究方向列"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "test.db"
+        init_db(self.db_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _seed(self):
+        with get_conn(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO articles "
+                "(pmid, title, abstract, pub_year, pub_month, journal, "
+                "pmc_id, raw_xml_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("1", "Title 1", "Abstract 1", "2026", "Jan", "Plant J",
+                     "PMC1", "b.xml"),
+                    ("2", "Title 2", "Abstract 2", "2026", "Jan", "Plant J",
+                     "PMC2", "b.xml"),
+                    ("3", "Title 3", "Abstract 3", "2026", "Jan", "Plant J",
+                     "PMC3", "b.xml"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO llm_validation "
+                "(pmid, llm_verdict, reason, validated_at, research_field, "
+                "human_review) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("1", "RELEVANT", "r1", "2026-01-01T00:00:00", "遗传育种", None),
+                    ("2", "RELEVANT", "r2", "2026-09-01T00:00:00", "植物保护", None),
+                    ("3", "NOT_RELEVANT", "r3", "2026-09-02T00:00:00", "", None),
+                ],
+            )
+
+    def _export(self, since):
+        import cleaner.llm_validator as mod
+        orig = mod.OUTPUT_DIR
+        mod.OUTPUT_DIR = self.temp_dir
+        try:
+            return mod.export_incremental_filtered_csv(since, db_path=self.db_path)
+        finally:
+            mod.OUTPUT_DIR = orig
+
+    def test_columns_carry_research_field(self):
+        self._seed()
+        path = self._export("2026-08-01T00:00:00")
+        self.assertIsNotNone(path)
+        self.assertTrue(path.name.startswith("llm_filtered_incremental"), path.name)
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            self.assertEqual(reader.fieldnames, FILTERED_EXPORT_FIELDS)
+            self.assertEqual(reader.fieldnames[-4:],
+                             ["llm_verdict", "llm_reason", "research_field",
+                              "human_review"])
+            rows = list(reader)
+        self.assertEqual([r["pmid"] for r in rows], ["2"])
+        self.assertEqual(rows[0]["research_field"], "植物保护")
+        self.assertEqual(rows[0]["llm_reason"], "r2")
+
+    def test_filters_out_not_relevant_and_old_timestamps(self):
+        self._seed()
+        # since 早于全部记录 → 只受复核谓词过滤，NOT_RELEVANT 仍应被排除
+        path = self._export("2025-01-01T00:00:00")
+        with open(path, "r", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(sorted(r["pmid"] for r in rows), ["1", "2"])
+
+    def test_no_rows_returns_none(self):
+        self._seed()
+        self.assertIsNone(self._export("2027-01-01T00:00:00"))
+
+
+class TestReviewPendingCsv(unittest.TestCase):
+    """待复核清单：摘要为空转人工（needs_review）的文献必须出现在清单里
+
+    这类文献没有 llm_validation 行（跳过 LLM），若清单只 JOIN llm_validation，
+    人工就永远看不到它们——规则改了但人拿不到活干。
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "test.db"
+        init_db(self.db_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _seed(self):
+        with get_conn(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO articles (pmid, title, abstract, pub_year, journal, "
+                "article_types) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("1", "LLM 已判相关", "Abstract 1", 2020, "Plant J", "Review"),
+                    ("2", "LLM 已判不相关", "Abstract 2", 2020, "Plant J",
+                     "Journal Article"),
+                    ("3", "无摘要待人工", "", 1953, "Agron J", "Journal Article"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO llm_validation (pmid, llm_verdict, reason, "
+                "validated_at, research_field, human_review) VALUES (?,?,?,?,?,?)",
+                [
+                    ("1", "RELEVANT", "r1", "2026-01-01T00:00:00", "遗传育种", None),
+                    ("2", "NOT_RELEVANT", "r2", "2026-01-01T00:00:00", "", None),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO filter_log (pmid, stage, reason, filtered_at) "
+                "VALUES ('3', 'needs_review', 'abstract_empty', "
+                "'2026-01-01T00:00:00')"
+            )
+
+    def _export(self):
+        import cleaner.llm_validator as mod
+        orig = mod.OUTPUT_DIR
+        mod.OUTPUT_DIR = self.temp_dir
+        try:
+            return mod._export_review_csv(self.db_path)
+        finally:
+            mod.OUTPUT_DIR = orig
+
+    def test_manual_rows_are_included(self):
+        self._seed()
+        path = self._export()
+        self.assertIsNotNone(path)
+        self.assertTrue(path.name.startswith("llm_review_pending_"), path.name)
+
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            rows = list(reader)
+
+        # 补的三列必须在，人工无摘要时只能靠它们判断
+        for col in ("pub_year", "journal", "article_types"):
+            self.assertIn(col, fieldnames)
+        self.assertEqual(fieldnames, REVIEW_PENDING_FIELDS)
+
+        self.assertEqual(sorted(r["pmid"] for r in rows), ["1", "2", "3"])
+        manual = next(r for r in rows if r["pmid"] == "3")
+        # 转审行必须显式标注，不能伪装成模型判过
+        self.assertEqual(manual["llm_verdict"], NEEDS_REVIEW_VERDICT)
+        self.assertEqual(manual["reason"], "abstract_empty")
+        self.assertEqual(manual["pub_year"], "1953")
+        self.assertEqual(manual["journal"], "Agron J")
+        self.assertEqual(manual["research_field"], "")
+
+    def test_already_reviewed_articles_are_excluded(self):
+        self._seed()
+        with get_conn(self.db_path) as conn:
+            conn.execute("UPDATE llm_validation SET human_review='Y' WHERE pmid='1'")
+            conn.execute("UPDATE llm_validation SET human_review='N' WHERE pmid='2'")
+        path = self._export()
+        with open(path, "r", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual([r["pmid"] for r in rows], ["3"])
+
+    def test_manual_row_dropped_once_validated(self):
+        """转审文献一旦有了 llm_validation 行（人工判完），不再作为转审项重复出现"""
+        self._seed()
+        with get_conn(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO llm_validation (pmid, llm_verdict, reason, "
+                "validated_at, research_field, human_review) "
+                "VALUES ('3', 'RELEVANT', '人工', '2026-02-01T00:00:00', '栽培生理', NULL)"
+            )
+        path = self._export()
+        with open(path, "r", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        three = [r for r in rows if r["pmid"] == "3"]
+        self.assertEqual(len(three), 1)
+        self.assertEqual(three[0]["llm_verdict"], "RELEVANT")
+        self.assertEqual(three[0]["research_field"], "栽培生理")
+
+
+class TestImportHumanReviewManualRows(unittest.TestCase):
+    """人工复核导入：摘要为空的转审文献没有 llm_validation 行，判 Y 必须建行
+
+    否则 _REVIEW_PASS_PREDICATE 匹配不到它，人工放行也导不出去。
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "test.db"
+        init_db(self.db_path)
+        with get_conn(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO articles (pmid, title, abstract, pub_year, journal) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    ("1", "T1", "Abstract 1", 2020, "J"),
+                    ("2", "T2", "", 1953, "J"),
+                    ("3", "T3", "", 1955, "J"),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO llm_validation (pmid, llm_verdict, reason, "
+                "validated_at, research_field, human_review) "
+                "VALUES ('1', 'NOT_RELEVANT', 'r1', '2026-01-01T00:00:00', '', NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO filter_log (pmid, stage, reason, filtered_at) "
+                "VALUES (?, 'needs_review', 'abstract_empty', '2026-01-01T00:00:00')",
+                [("2",), ("3",)],
+            )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _write_review_csv(self, rows):
+        path = Path(self.temp_dir) / "review.csv"
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=REVIEW_PENDING_FIELDS)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+        return path
+
+    def _import(self, csv_path):
+        import cleaner.llm_validator as mod
+        orig_db, orig_out = mod.DB_PATH, mod.OUTPUT_DIR
+        mod.DB_PATH, mod.OUTPUT_DIR = self.db_path, self.temp_dir
+        try:
+            return mod.import_human_review(str(csv_path))
+        finally:
+            mod.DB_PATH, mod.OUTPUT_DIR = orig_db, orig_out
+
+    def _row(self, pmid, review, verdict, field=""):
+        return {"pmid": pmid, "title": "T", "abstract": "", "pub_year": "1953",
+                "journal": "J", "article_types": "Journal Article",
+                "llm_verdict": verdict, "reason": "abstract_empty",
+                "research_field": field, "human_review": review}
+
+    def test_manual_yes_creates_validation_row(self):
+        csv_path = self._write_review_csv([self._row("2", "Y", "NEEDS_REVIEW")])
+        stats = self._import(csv_path)
+
+        self.assertEqual(stats["passed"], 1)
+        self.assertEqual(stats["manual_inserted"], 1)
+
+        with get_conn(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM llm_validation WHERE pmid='2'"
+            ).fetchone()
+        self.assertEqual(row["llm_verdict"], "RELEVANT")
+        self.assertEqual(row["human_review"], "Y")
+        # 未给方向 → 兜底默认值（不判失败）
+        self.assertEqual(row["research_field"], DEFAULT_RESEARCH_FIELD)
+
+    def test_manual_no_creates_not_relevant_row(self):
+        csv_path = self._write_review_csv([self._row("3", "N", "NEEDS_REVIEW")])
+        stats = self._import(csv_path)
+
+        self.assertEqual(stats["rejected"], 1)
+        self.assertEqual(stats["manual_inserted"], 1)
+
+        with get_conn(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM llm_validation WHERE pmid='3'"
+            ).fetchone()
+        self.assertEqual(row["llm_verdict"], "NOT_RELEVANT")
+        self.assertEqual(row["human_review"], "N")
+        # NOT_RELEVANT 不带方向
+        self.assertEqual(row["research_field"], "")
+
+    def test_manual_row_keeps_given_research_field(self):
+        csv_path = self._write_review_csv(
+            [self._row("2", "Y", "NEEDS_REVIEW", field="植物保护")]
+        )
+        self._import(csv_path)
+        with get_conn(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT research_field FROM llm_validation WHERE pmid='2'"
+            ).fetchone()
+        self.assertEqual(row["research_field"], "植物保护")
+
+    def test_llm_rows_still_use_update_path(self):
+        """已有 llm_validation 行的记录仍走 UPDATE，不新建重复行"""
+        csv_path = self._write_review_csv([self._row("1", "Y", "NOT_RELEVANT")])
+        stats = self._import(csv_path)
+
+        self.assertEqual(stats["manual_inserted"], 0)
+        with get_conn(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM llm_validation WHERE pmid='1'"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["human_review"], "Y")
+        # UPDATE 路径不改 llm_verdict
+        self.assertEqual(rows[0]["llm_verdict"], "NOT_RELEVANT")
+
+    def test_manual_yes_becomes_exportable(self):
+        """人工放行的转审文献必须能进最终导出（复核谓词链路打通）"""
+        csv_path = self._write_review_csv([self._row("2", "Y", "NEEDS_REVIEW")])
+        self._import(csv_path)
+
+        import cleaner.llm_validator as mod
+        orig_db, orig_out = mod.DB_PATH, mod.OUTPUT_DIR
+        mod.DB_PATH, mod.OUTPUT_DIR = self.db_path, self.temp_dir
+        try:
+            path = mod._export_filtered_csv()
+        finally:
+            mod.DB_PATH, mod.OUTPUT_DIR = orig_db, orig_out
+
+        self.assertIsNotNone(path)
+        with open(path, "r", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        self.assertIn("2", [r["pmid"] for r in rows])
 
 
 if __name__ == "__main__":

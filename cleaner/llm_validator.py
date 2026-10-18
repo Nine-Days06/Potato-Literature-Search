@@ -21,6 +21,7 @@ from config.settings import (
     LLM_PROVIDER, LLM_PROVIDER_CONFIGS,
     LLM_BATCH_POLL_INTERVAL, LLM_BATCH_TIMEOUT, LLM_BATCH_AUTO_DELETE,
     ZHIPU_API_KEY, ZHIPU_BATCH_MODEL,
+    RESEARCH_FIELDS, DEFAULT_RESEARCH_FIELD,
 )
 from utils import now_iso
 from utils.db import get_conn
@@ -133,319 +134,126 @@ def _extract_json(text: str, fix_glm_multi_array: bool = False) -> list | None:
 
 
 SYSTEM_PROMPT = (
-    "你是一个马铃薯（Solanum tuberosum）知识图谱构建领域的专家。\n"
-    "本项目的目标是从文献摘要中提取马铃薯相关的实体关系三元组，用于构建知识图谱。\n"
-    "知识图谱的核心实体是马铃薯（Solanum tuberosum）自身的内源基因/蛋白，"
-    "核心关系是「基因-功能-性状」关系链（内源基因 → 功能/作用机制 → 性状）。\n"
-    "判断以下每篇文献的摘要是否包含可用于知识图谱构建的实体关系信息。\n\n"
-     "可关注的实体类型：\n"
-    "1. 基因/转录本/蛋白质（必须是马铃薯自身的内源基因/蛋白，"
-    "如 Gro1-4、StTCP23、StBEL5、invGE/GF 等具体基因名）\n"
-    "2. 性状/表型（产量、块茎品质、抗病性、耐逆性、淀粉含量、休眠、植株形态等）\n"
-    "3. 病虫害/病原（晚疫病 Phytophthora、青枯病、根结线虫、PVY 病毒、甲虫等）\n"
-    "4. 胁迫条件（干旱、冷害、热害、盐害、氧化胁迫等）\n"
-    "5. 代谢物/化合物（淀粉、花青素、龙葵素、还原糖、糖苷生物碱等）\n\n"
-     "可关注的实体关系类型（不限于此）：\n"
-    "- 基因-功能-性状（核心链路）：马铃薯内源基因 → 功能/作用机制 → 性状\n"
-    "- 基因 → 调控/影响/关联 → 性状\n"
-    "- 基因 → 赋予 → 抗性（对某病虫害/胁迫）\n"
-    "- 处理/条件 → 改变 → 基因表达\n\n"
-     "判断步骤（请按以下顺序逐一分析后给出最终判定）：\n"
-     "1. 核心研究对象：这篇文献主要研究什么？\n"
-     "   - 马铃薯本身的生物学问题（基因功能、性状、抗病性、发育、"
-     "代谢、胁迫响应、组学等）\n"
-     "   - 马铃薯与其他生物的相互作用（抗病/感病机制、病原菌-"
-     "马铃薯互作等）\n"
-     "   - 马铃薯品种选育/种质资源/农艺性状评价（仅农艺层面而无"
-     "内源基因功能关系的，当前暂不收录）\n"
-     "   - 外源基因研究（在马铃薯中表达/研究非马铃薯来源的基因，"
-     "如细菌、真菌、其他植物基因的功能）\n"
-     "   - 上述以外的对象（如病原菌自身生命活动不涉及互作、"
-     "其他物种、通用机制、加工储藏等）\n"
-     "2. 关键实体：摘要中出现了哪些可关注的实体？（列出具体名称）\n"
-     "3. 核心关系：实体之间的核心关系是什么？是否涉及马铃薯与"
-     "实体的相互作用？\n"
-     "4. 参照下方判断标准，得出最终 verdict\n"
-     "5. 实体命名硬性检查（最高优先级，先行确认）：摘要中是否明确给出"
-     "至少一个具体命名的马铃薯内源基因/蛋白名称（如 StXxx、Gro1-4、"
-     "invGE/GF 等字母/数字组合成名的实体）？若仅以「a gene / this gene / "
-     "某种基因」等泛指形式出现而未给出任何具体名称，即使涉及转基因、"
-     "RNAi 沉默等实验手段和基因-功能-性状关系，也一律直接判定 "
-     "NOT_RELEVANT，不再考虑其他任何 RELEVANT 规则。\n\n"
-     "判断标准：\n"
-    "- 摘要中涉及至少一对实体及其关系（分子层面：马铃薯内源基因/蛋白/代谢物等"
-     "分子实体与其功能、性状的关系），且以马铃薯（Solanum tuberosum）为"
-     "核心研究对象 → RELEVANT。其中基因/蛋白实体必须在摘要中明确给出"
-     "具体名称，不得以「某种基因/a gene」泛指代替\n"
-    "- 通过转基因/超表达/RNAi 沉默/基因编辑等手段验证马铃薯自身"
-     "内源基因的功能、性状关系 → RELEVANT（基因必须是马铃薯内源的，"
-     "实验手段不影响判定；但摘要须点明具体内源基因/蛋白名称，"
-     "仅以「某种基因」泛指的除外）\n"
-    "- 摘要仅泛泛讨论马铃薯，未涉及具体的实体-关系对 → NOT_RELEVANT\n"
-    "- 摘要仅以「某种基因/a gene」等泛指形式提及基因/蛋白，"
-     "未给出任何具体的马铃薯内源基因/蛋白名称（如 StXxx、Gro1-4），"
-     "即使涉及基因-功能-性状关系，也无法提取具体实体命名三元组 "
-     "→ NOT_RELEVANT（判定时必须以摘要中明确出现的具体基因/蛋白名称为准，"
-     "不得推断或默认其存在）\n"
-    "- 摘要研究其他物种，不涉及马铃薯 → NOT_RELEVANT\n"
-    "- 文献核心贡献是方法学开发，仅以马铃薯或马铃薯病原菌作为"
-     "方法验证的模型系统，而非研究马铃薯本身的生物学问题 → NOT_RELEVANT\n"
-    "- 摘要中的实体关系仅涉及病虫害/病原菌/病毒自身的生命活动"
-     "（如病原菌自身的基因功能、发育、代谢、蛋白结构），"
-     "不涉及这些实体与马铃薯的直接相互作用"
-     "（如抗性、感病、对产量/品质的影响） → NOT_RELEVANT\n"
-    "- 核心研究对象是外源基因（非马铃薯来源，如细菌、真菌、其他植物基因）"
-     "在马铃薯中的表达、功能或其引起的性状改变，不含马铃薯自身内源基因的"
-     "功能信息，无法构成马铃薯基因-功能-性状实体对 → NOT_RELEVANT\n"
-    "- 研究停留在农艺/育种/基因型层面（如品种/基因型比较、杂交育种、"
-     "体细胞杂交、农艺性状评价），未涉及任何马铃薯内源基因/蛋白的"
-     "功能-性状关系 → NOT_RELEVANT（当前图谱仅收录分子层面"
-     "基因-功能-性状，农艺层面暂不收录）\n"
-    "- 仅讨论胁迫/环境/处理对性状、代谢物或生理过程的宏观影响，"
-     "未涉及马铃薯内源基因/蛋白的功能-性状关系 → NOT_RELEVANT\n"
-    "- 说明：GFP、GUS 等报告基因（reporter gene）仅作为实验工具，"
-     "本身不是研究对象，不影响判定\n"
-    "- 注意：甘薯/红薯（sweet potato, Ipomoea batatas）不是马铃薯，"
-     "以甘薯为主要研究对象的文献 → NOT_RELEVANT\n\n"
-     "示例：\n\n"
-     "示例1 — RELEVANT（基因→抗性）\n"
-    "PMID: 15078331\n"
-    "Title: Molecular cloning of the potato Gro1-4 gene conferring "
-    "resistance to pathotype Ro1 of the root cyst nematode Globodera "
-    "rostochiensis, based on a candidate gene approach.\n"
-    "Abstract: The endoparasitic root cyst nematode Globodera "
-    "rostochiensis causes considerable damage in potato cultivation. "
-    "In the past, major genes for nematode resistance have been "
-    "introgressed from related potato species into cultivars. "
-    "Elucidating the molecular basis of resistance will contribute to "
-    "the understanding of nematode-plant interactions and assist in "
-    "breeding nematode-resistant cultivars. The Gro1 resistance locus "
-    "to G. rostochiensis on potato chromosome VII co-localized with a "
-    "resistance-gene-like (RGL) DNA marker. This marker was used to "
-    "isolate from genomic libraries 15 members of a closely related "
-    "candidate gene family. Analysis of inheritance, linkage mapping, "
-    "and sequencing reduced the number of candidate genes to three. "
-    "Complementation analysis by stable potato transformation showed "
-    "that the gene Gro1-4 conferred resistance to G. rostochiensis "
-    "pathotype Ro1. Gro1-4 encodes a protein of 1136 amino acids that "
-    "contains Toll-interleukin 1 receptor (TIR), nucleotide-binding "
-    "(NB), leucine-rich repeat (LRR) homology domains and a C-terminal "
-    "domain with unknown function. The deduced Gro1-4 protein differed "
-    "by 29 amino acid changes from susceptible members of the Gro1 gene "
-    "family. Sequence characterization of 13 members of the Gro1 gene "
-    "family revealed putative regulatory elements and a variable "
-    "microsatellite in the promoter region, insertion of a "
-    "retrotransposon-like element in the first intron, and a stop codon "
-    "in the NB coding region of some genes. Sequence analysis of RT-PCR "
-    "products showed that Gro1-4 is expressed, among other members of "
-    "the family including putative pseudogenes, in non-infected roots "
-    "of nematode-resistant plants. RT-PCR also demonstrated that "
-    "members of the Gro1 gene family are expressed in most potato "
-    "tissues.\n\n"
-     "示例2 — RELEVANT（基因→品质性状）\n"
-    "PMID: 15802505\n"
-    "Title: DNA variation at the invertase locus invGE/GF is "
-    "associated with tuber quality traits in populations of potato "
-    "breeding clones.\n"
-    "Abstract: Starch and sugar content of potato tubers are "
-    "quantitative traits, which are models for the candidate gene "
-    "approach for identifying the molecular basis of quantitative "
-    "trait loci (QTL) in noninbred plants. Starch and sugar content "
-    "are also important for the quality of processed products such as "
-    "potato chips and French fries. A high content of the reducing "
-    "sugars glucose and fructose results in inferior chip quality. "
-    "Tuber starch content affects nutritional quality. Functional and "
-    "genetic models suggest that genes encoding invertases control, "
-    "among other things, tuber sugar content. The invGE/GF locus on "
-    "potato chromosome IX consists of duplicated invertase genes invGE "
-    "and invGF and colocalizes with cold-sweetening QTL Sug9. DNA "
-    "variation at invGE/GF was analyzed in 188 tetraploid potato "
-    "cultivars, which have been assessed for chip quality and tuber "
-    "starch content. Two closely correlated invertase alleles, "
-    "invGE-f and invGF-d, were associated with better chip quality in "
-    "three breeding populations. Allele invGF-b was associated with "
-    "lower tuber starch content. The potato invertase gene invGE is "
-    "orthologous to the tomato invertase gene Lin5, which is causal "
-    "for the fruit-sugar-yield QTL Brix9-2-5, suggesting that natural "
-    "variation of sugar yield in tomato fruits and sugar content of "
-    "potato tubers is controlled by functional variants of orthologous "
-    "invertase genes.\n\n"
-     "示例3 — NOT_RELEVANT（农艺/育种层面，无分子实体）\n"
-    "PMID: 28742868\n"
-    "Title: Combining ability of highland tropic adapted potato for "
-    "tuber yield and yield components under drought.\n"
-    "Abstract: Recurrent drought and late blight disease are the "
-    "major factors limiting potato productivity in the northwest "
-    "Ethiopian highlands. Incorporating drought tolerance and late "
-    "blight resistance in the same genotypes will enable the "
-    "development of cultivars with high and stable yield potential "
-    "under erratic rainfall conditions. The objectives of this study "
-    "were to assess combining ability effects and gene action for "
-    "tuber yield and traits related to drought tolerance in the "
-    "International Potato Centre's (CIP's) advanced clones from the "
-    "late blight resistant breeding population B group 'B3C2' and to "
-    "identify promising parents and families for cultivar development. "
-    "Sixteen advanced clones from the late blight resistant breeding "
-    "population were crossed in two sets using the North Carolina "
-    "Design II. The resulting 32 families were evaluated together with "
-    "five checks and 12 parental clones in a 7 x 7 lattice design with "
-    "two water regimes and two replications. The experiment was "
-    "carried out at Adet, in northwest Ethiopia under well-watered and "
-    "water stressed conditions with terminal drought imposed from the "
-    "tuber bulking stage. The results showed highly significant "
-    "differences between families, checks, and parents for growth, "
-    "physiological, and tuber yield related traits. Traits including "
-    "marketable tuber yield, marketable tuber number, average tuber "
-    "weight and groundcover were positively correlated with total "
-    "tuber yield under both drought stressed and well-watered "
-    "conditions. Plant height was correlated with yield only under "
-    "drought stressed condition. GCA was more important than SCA for "
-    "total tuber yield, marketable tuber yield, average tuber weight, "
-    "plant height, groundcover, and chlorophyll content under stress. "
-    "This study identified the parents with best GCA and the "
-    "combinations with best SCA effects, for both tuber yield and "
-    "drought tolerance related traits. The new population is shown to "
-    "be a valuable genetic resource for variety selection and "
-    "improvement of potato's adaptation to the drought prone areas in "
-    "northwest Ethiopia and similar environments.\n\n"
-     "示例4 — NOT_RELEVANT（方法学论文，仅以马铃薯病原菌为模型）\n"
-    "PMID: 10658663\n"
-    "Title: cDNA-AFLP analysis of differential gene expression in "
-    "the prokaryotic plant pathogen Erwinia carotovora.\n"
-    "Abstract: For studies of differential gene expression in "
-    "prokaryotes, methods for synthesizing representative cDNA "
-    "populations are required. Here, a technique is described for "
-    "the synthesis of cDNA from the potato pathogens Erwinia "
-    "carotovora subsp. atroseptica (Eca) and Erwinia carotovora "
-    "subsp. carotovora (Ecc) using a combination of short "
-    "oligonucleotide (11-mer) primers that were known to anneal to "
-    "conserved sequences in the 3' regions of enterobacterial genes. "
-    "Specific PCR amplifications with primers designed to anneal to "
-    "14 known genes from either Eca or Ecc revealed the presence of "
-    "the corresponding transcripts in cDNA, suggesting that the cDNA "
-    "represented a broad genomic coverage. cDNA-amplified fragment "
-    "length polymorphism (cDNA-AFLP) was used to identify "
-    "differentially expressed genes in Eca, including one that shows "
-    "significant similarity, at the protein level, to an avirulence "
-    "gene from Xanthomonas campestris pv. raphani. Northern analysis "
-    "was used to confirm that differentially amplified cDNA fragments "
-    "were derived from differentially expressed genes. This is the "
-"first report of the use of cDNA-AFLP to study differential gene "
-     "expression in prokaryotes.\n\n"
-     "示例5 — NOT_RELEVANT（外源细菌基因在马铃薯中表达）\n"
-    "PMID: 11231562\n"
-    "Title: Acceleration of potato tuber sprouting by the expression of "
-    "a bacterial pyrophosphatase.\n"
-    "Abstract: Potato is a globally important crop. Unfortunately, "
-    "potato farming is plagued with problems associated with the "
-    "sprouting behavior of seed tubers. The data presented here "
-    "demonstrate that using transgenic technology can influence this "
-    "behavior. Transgenic tubers cytosolically expressing an inorganic "
-    "pyrophosphatase gene derived from Escherichia coli under the "
-    "control of the tuber-specific patatin promoter display "
-    "significantly accelerated sprouting. The period of presprouting "
-    "dormancy for transgenic tubers planted immediately after harvest "
-    "is reduced by six to seven weeks when compared to wild-type "
-    "tubers. This study demonstrates a method with which to regulate "
-    "dormancy, an important aspect of potato crop management.\n\n"
-     "示例6 — NOT_RELEVANT（外源植物基因在马铃薯中表达）\n"
-    "PMID: 11262007\n"
-    "Title: Control of enzymatic browning in potato (Solanum tuberosum "
-    "L.) by sense and antisense RNA from tomato polyphenol oxidase.\n"
-    "Abstract: Polyphenol oxidase (PPO) activity of Russet Burbank "
-    "potato was inhibited by sense and antisense PPO RNAs expressed "
-    "from a tomato PPO cDNA under the control of the 35S promoter. "
-    "Transgenic Russet Burbank potato plants from 37 different lines "
-    "were grown in the field. PPO activity and the level of enzymatic "
-    "browning were measured in the harvested tubers. Of the tubers from "
-    "28 transgenic lines, tubers from 5 lines exhibited reduced "
-    "browning, and PPO activity correlated with this reduction. These "
-    "results indicate that expression of tomato PPO RNA in sense or "
-    "antisense orientation inhibits PPO activity and enzymatic browning "
-    "in the major commercial potato cultivar. Furthermore, the findings "
-    "suggest that expression of closely related heterologous genes "
-    "could prevent enzymatic browning in a wide variety of food crops.\n\n"
-     "示例7 — RELEVANT（马铃薯内源基因功能验证，转基因手段）\n"
-    "PMID: 15078330\n"
-    "Title: The tandem complex of BEL and KNOX partners is required for "
-    "transcriptional repression of ga20ox1.\n"
-    "Abstract: Two interacting TALE proteins of potato, StBEL5 and "
-    "POTH1, mediate developmental processes by regulating phytohormone "
-    "levels. Overexpression of either partner alone increased tuber "
-    "yields by lowering gibberellin (GA) levels and increasing "
-    "cytokinins. StBEL5 and POTH1 bind to the regulatory region of "
-    "ga20ox1 from potato. The StBEL5-POTH1 heterodimer suppressed the "
-    "activity of the ga20ox1 promoter by more than 50%. These results "
-    "indicate that the tandem interaction of StBEL5 and POTH1 is "
-    "essential for regulation of the target gene, affecting tuber "
-    "yield.\n\n"
-     "示例8 — RELEVANT（胁迫-基因-耐逆性状）\n"
-    "PMID: 17207469\n"
-    "Title: Ethylene responsive element binding protein 1 (StEREBP1) "
-    "from Solanum tuberosum increases tolerance to abiotic stress in "
-    "transgenic potato plants.\n"
-    "Abstract: To identify components of the plant stress signal "
-    "transduction cascade, we chose the ethylene responsive element "
-    "binding protein 1 (StEREBP1) for characterization. Northern blot "
-    "analysis showed enhanced transcription of StEREBP1 in response to "
-    "several environmental stresses including low temperature. "
-    "StEREBP1 was found to bind to GCC and DRE/CRT cis-elements, and "
-    "overexpression of StEREBP1 induced several GCC box-containing "
-    "stress response genes. In addition, overexpression of StEREBP1 "
-    "enhanced tolerance to cold and salt stress in transgenic potato "
-    "plants. The results suggest that StEREBP1 is a functional "
-    "transcription factor involved in abiotic stress responses.\n\n"
-     "示例9 — NOT_RELEVANT（胁迫/处理→生理变化，无内源基因功能关系）\n"
-    "PMID: 11080304\n"
-    "Title: Impact of post-anoxia stress on membrane lipids of "
-    "anoxia-pretreated potato cells. A re-appraisal.\n"
-    "Abstract: The importance of lipid peroxidation and its contributing "
-    "pathways (via reactive oxygen species and lipoxygenase) during "
-    "post-anoxia was evaluated using potato (Solanum tuberosum) cell "
-    "cultures. When anoxic cells were re-oxygenated, lipid hydroperoxides "
-    "were detected only upon feeding cells with H2O2, no accumulation was "
-    "found otherwise, and cell viability was preserved. The study "
-    "investigates membrane lipid changes under anoxia-reoxygenation "
-    "stress in potato cells without addressing any potato gene or "
-    "protein's function-trait relationship.\n\n"
-     "示例10 — NOT_RELEVANT（基因/蛋白未指名具体名称）\n"
-    "PMID: 20102600\n"
-    "Title: A potato gene involved in cold tolerance as revealed by "
-    "expression profiling.\n"
-    "Abstract: We identified a gene that was differentially expressed "
-    "in cold-stressed potato. Transgenic potato plants overexpressing "
-    "and RNAi-silenced lines of this gene showed altered freezing "
-    "tolerance, and the gene influenced expression of several "
-    "carbohydrate-related transcripts. The identification of this "
-    "gene may help improve potato cold tolerance in the future. "
-    "全篇对基因仅以「a gene / this gene」泛指，未给出任何具体名称。\n"
-    "（注：① 摘要中的基因未给出具体名称，无法提取命名实体 → "
-    "判 NOT_RELEVANT；② 即使通过转基因/RNAi 等手段验证其功能，"
-    "只要基因未点名，一律 NOT_RELEVANT）\n\n"
-     "请以 JSON 对象格式逐条回答，不要包含其他内容：\n"
+    "你是一个马铃薯（Solanum tuberosum）文献数据库建设的专家。\n"
+    "本项目的目标是收录所有与马铃薯相关的文献，不限研究方向：\n"
+    "分子生物学、遗传育种、栽培生理、植物保护、加工储藏、品质营养、\n"
+    "产后处理、产业经济、综述评论等均在收录范围内。\n\n"
+    # ── 选型依据（见 bench_prompts.py 的 V3_CHECK）──
+    # 300 篇基准集、每版本 3 次运行多数票、双模型配对口径：
+    #   glm-4-Flash 金标准 168/170 = 0.9882，deepseek-v4.1-flash 179/180 = 0.9944，
+    #   跨模型平均 0.9912，为 7 个候选版本中最高。
+    # 曾试过加「物种甄别」块（V5/V6/V7）：glm 上甘薯误收从 13% 降到 3%，
+    # 但 deepseek 上反而多误排一篇正例（31277248，标题明确 "in Solanum tuberosum"），
+    # 且提示词长 500 字符。V7 试图删掉「其他 Solanum 属一律排除」那句以消除规则
+    # 冲突，结果 glm 上甘薯误收反弹到 4/30——那句是物种甄别的严格性锚点，删不得。
+    # 结论：当前生产跑 deepseek，取 V3 的零真错 + 更短提示词。
+    "判断标准只有一个核心问题：这篇文献是否以马铃薯（或其近缘种、\n"
+    "其块茎/植株/种质资源、其病虫害互作、其加工产品）为研究对象\n"
+    "或重要研究材料。\n\n"
+    "判断标准：\n"
+    "- 以马铃薯的任何方面为研究对象：基因功能、性状、育种、栽培、\n"
+    "  病虫害、生理、加工、储藏、品质、营养、经济等 → RELEVANT\n"
+    "- 以马铃薯近缘种/野生种（Solanum sect. Petota 等）为研究对象 → RELEVANT\n"
+    "- 以马铃薯病原物（晚疫病菌、青枯菌、线虫、病毒等）与马铃薯的\n"
+    "  互作，甚至病原物本身的研究（植保背景）→ RELEVANT\n"
+    "- 以马铃薯块茎或加工产品（薯片、薯条、淀粉等）为材料的\n"
+    " 食品科学研究 → RELEVANT\n"
+    "- 马铃薯相关综述、方法学论文（以马铃薯为研究对象或材料）→ RELEVANT\n"
+    "- 甘薯/红薯（sweet potato, Ipomoea batatas）为主要研究对象，\n"
+    "    马铃薯仅作对比 → NOT_RELEVANT\n"
+    "- 马铃薯仅在摘要中顺带提及（如列举多种作物之一），\n"
+    "   研究对象与马铃薯无实质关联 → NOT_RELEVANT\n"
+    "- 研究对象与马铃薯完全无关 → NOT_RELEVANT\n"
+    # ── 「顺带提及」的可执行判定 ──
+    # 经基准测试：全样本特异度 0.35 → 0.55（glm），主要是把「通用方法在多
+    # 物种上验证」「多物种并列筛选」这两类误收压下去。
+    "\n## 「顺带提及」的判定（务必严格）\n"
+    "以下情形属于「马铃薯不是研究对象」，一律判 NOT_RELEVANT：\n"
+    "1. 通用方法/通用材料研究：研究对象是某种通用技术、试剂盒、\n"
+    "   提取流程、测序方法或通用仪器，马铃薯只是被验证的物种之一。\n"
+    "   例：某 DNA 提取法在 45 种植物（含马铃薯）上验证 → NOT_RELEVANT\n"
+    "2. 多物种并列筛选：马铃薯与水稻、小麦、番茄等并列出现在\n"
+    "   物种列表、比较矩阵或统计样本中，没有针对马铃薯的单独结论。\n"
+    "3. 马铃薯仅作对照/背景：以其他作物（尤其甘薯 Ipomoea batatas）\n"
+    "   或非植物对象（真菌、细菌、动物）为主体，马铃薯只出现在\n"
+    "   对比组、培养基成分（如马铃薯葡萄糖琼脂 PDA）、\n"
+    "   背景介绍或参考文献里。\n"
+    "4. 名称陷阱：sweet potato / 红薯 / 木薯 / 马铃薯淀粉仅作为\n"
+    "   通用商品名出现时，需判断主体物种；主体是甘薯等非马铃薯\n"
+    "   作物时判 NOT_RELEVANT。\n"
+    "\n判定问句（必须能对第一条回答「是」才判 RELEVANT）：\n"
+    "- 若把马铃薯从这篇文献里去掉，文献的核心结论是否还能成立？\n"
+    "  能成立 → 马铃薯不是研究对象 → NOT_RELEVANT\n"
+    "- 文献的标题或摘要主体句，是否以马铃薯（或其产品/病原互作）\n"
+    "  为主语或核心实验材料？\n"
+    # ── 输出前自检 ──
+    # 经基准测试：加上这块后，模型「理由里写着顺带提及、结论却判 RELEVANT」
+    # 的自相矛盾基本消失，是 V1→V3 特异度提升的主要来源。
+    "\n## 输出前自检\n"
+    "逐条判定后，先在心里回答这两个问题，再决定 verdict：\n"
+    "  Q1 马铃薯是否是核心研究对象或关键实验材料？（是/否）\n"
+    "  Q2 马铃薯是否只出现在物种列表、对比组、通用方法或背景中？（是/否）\n"
+    "Q1=否 或 Q2=是 → NOT_RELEVANT；否则 RELEVANT。\n"
+    "若理由中出现了「仅作对比」「顺带提及」「验证物种之一」「通用方法」\n"
+    "等措辞，则 verdict 必须是 NOT_RELEVANT，两者不得矛盾。\n"
+    "\n## 研究方向分类\n"
+    "对判为 RELEVANT 的文献，还必须从下列枚举中选择一个最贴合的\n"
+    "研究方向，写入 research_field 字段（只能选一个，不得自造标签）：\n"
+    + "".join(f"  - {f}\n" for f in RESEARCH_FIELDS) +
+    "判为 NOT_RELEVANT 时 research_field 填空字符串 \"\"。\n\n"
+    "请以 JSON 对象格式逐条回答，不要包含其他内容：\n"
     '{"results":[{"pmid":"...","verdict":"RELEVANT 或 NOT_RELEVANT",'
-    '"reason":"请用中文简要说明判断依据，指出摘要中出现的实体和关系"}]}'
+    '"reason":"请用中文简要说明判断依据，指出核心研究对象是否为马铃薯",'
+    '"research_field":"研究方向枚举之一，NOT_RELEVANT 时留空"}]}'
 )
 
 INSERT_SQL = """
 INSERT INTO llm_validation
-    (pmid, llm_verdict, reason, validated_at, human_review)
-VALUES (?, ?, ?, ?, NULL)
+    (pmid, llm_verdict, reason, validated_at, research_field, human_review)
+VALUES (?, ?, ?, ?, ?, NULL)
 ON CONFLICT(pmid) DO UPDATE SET
     llm_verdict = excluded.llm_verdict,
     reason = excluded.reason,
-    validated_at = excluded.validated_at
+    validated_at = excluded.validated_at,
+    research_field = excluded.research_field
 """
 
 UPDATE_HUMAN_REVIEW_SQL = """
 UPDATE llm_validation SET human_review = ? WHERE pmid = ?
 """
 
+# 摘要为空转人工的文献没有 llm_validation 行，人工判完必须建行并直接带 human_review。
+# 不能复用 INSERT_SQL：它的 human_review 是字面量 NULL（LLM 验证路径要求重置为待复核），
+# 用它会让人工结论被写丢，文献又回到待复核队列。
+INSERT_MANUAL_REVIEW_SQL = """
+INSERT INTO llm_validation
+    (pmid, llm_verdict, reason, validated_at, research_field, human_review)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(pmid) DO UPDATE SET
+    llm_verdict = excluded.llm_verdict,
+    reason = excluded.reason,
+    validated_at = excluded.validated_at,
+    research_field = excluded.research_field,
+    human_review = excluded.human_review
+"""
+
+# 摘要为空、跳过 LLM 直接转人工的文献在复核清单里的 verdict 占位值。
+# 刻意不用 RELEVANT / NOT_RELEVANT：那会让"模型没看过"伪装成"模型判过"，
+# 人工据此照抄就会把未验证的结论当成已验证的结论。
+NEEDS_REVIEW_VERDICT = "NEEDS_REVIEW"
+
+# 人工复核清单列：比 llm_validation 侧多出 pub_year / journal / article_types，
+# 专为"无摘要"文献服务——人工只能靠标题+期刊+年份+文章类型判断相关性。
+REVIEW_PENDING_FIELDS = [
+    "pmid", "title", "abstract", "pub_year", "journal", "article_types",
+    "llm_verdict", "reason", "research_field", "human_review",
+]
+
 
 def _build_batch_prompt(rows: list) -> str:
     """为一批文献构建 prompt 正文"""
     parts = [
-        "以下是需要你根据上述标准判断的文献列表，请逐条判断摘要中是否存在可提取的实体关系：\n\n"
+        "以下是需要你根据上述标准判断的文献列表，请逐条判断其核心研究对象是否为马铃薯：\n\n"
     ]
     for i, row in enumerate(rows, 1):
         title = (row["title"] or "").strip()
@@ -577,10 +385,32 @@ def _normalize_verdict(value) -> str | None:
     return None
 
 
+def _normalize_research_field(value, verdict: str) -> str:
+    """
+    将 LLM 返回的 research_field 归一化到 RESEARCH_FIELDS 枚举。
+
+    - NOT_RELEVANT：不分类，一律返回 ""（不相关文献没有研究方向）
+    - 缺失 / 非字符串 / 不在枚举内：回退 DEFAULT_RESEARCH_FIELD（兜底，不判失败）
+      —— 方向只是附加维度，不值得为它整篇文献回退重试；
+      这也会把模型自造的标签（如 "分子生物学 " / "植物病理"）收敛到枚举。
+    """
+    if verdict != "RELEVANT":
+        return ""
+    if not isinstance(value, str):
+        return DEFAULT_RESEARCH_FIELD
+    field = value.strip()
+    if field in RESEARCH_FIELDS:
+        return field
+    return DEFAULT_RESEARCH_FIELD
+
+
 def _build_log_rows(batch, pmid_to_result, failed_set, now):
     """
-    将一批 LLM 结果整理为待入库 log_rows（4 元组：pmid, verdict, reason, now）
+    将一批 LLM 结果整理为待入库 log_rows
+    （5 元组：pmid, verdict, reason, now, research_field）
     与失败列表。verdict 缺失或非标准视为解析失败（回退重试），不写 UNKNOWN。
+    research_field 缺失/越界不判失败，回退 DEFAULT_RESEARCH_FIELD（见
+    _normalize_research_field）。
     """
     log_rows = []
     round_failed = []
@@ -597,16 +427,29 @@ def _build_log_rows(batch, pmid_to_result, failed_set, now):
         if verdict is None:
             round_failed.append(row)
             continue
-        log_rows.append((pmid, verdict, r.get("reason", ""), now))
+        research_field = _normalize_research_field(r.get("research_field"), verdict)
+        log_rows.append((pmid, verdict, r.get("reason", ""), now, research_field))
     return log_rows, round_failed
 
 
 def _count_verdicts(validated_rows: list) -> dict:
-    """统计 log_rows（4 元组: pmid, verdict, reason, now）中各 verdict 数量"""
+    """统计 log_rows（5 元组: pmid, verdict, reason, now, research_field）中各 verdict 数量"""
     verdicts = {}
-    for _, v, _, _ in validated_rows:
+    for _, v, _, _, _ in validated_rows:
         verdicts[v] = verdicts.get(v, 0) + 1
     return verdicts
+
+
+def _count_research_fields(conn) -> dict:
+    """统计各研究方向的文献数（仅含 RELEVANT）"""
+    return {
+        r[0]: r[1]
+        for r in conn.execute(
+            "SELECT research_field, COUNT(*) FROM llm_validation "
+            "WHERE llm_verdict = 'RELEVANT' AND research_field IS NOT NULL "
+            "AND research_field != '' GROUP BY research_field ORDER BY 2 DESC"
+        )
+    }
 
 
 def _run_sync_validation():
@@ -639,7 +482,8 @@ def _run_sync_validation():
                 WHERE a.abstract IS NOT NULL AND a.abstract != ''
                   AND a.pmid NOT IN (SELECT pmid FROM llm_validation)
                   AND a.pmid NOT IN (
-                      SELECT pmid FROM filter_log WHERE stage = 'hard_filter'
+                      SELECT pmid FROM filter_log
+                      WHERE stage IN ('hard_filter', 'needs_review')
                   )
             """).fetchall()
 
@@ -732,6 +576,8 @@ def _run_sync_validation():
         pct = c / len(all_validated) * 100
         logger.info(f"  {v}: {c} 篇 ({pct:.1f}%)")
 
+    _log_research_field_stats()
+
     csv_path = _export_review_csv()
     logger.info(f"LLM 验证完成，待复核清单: {csv_path}")
 
@@ -748,7 +594,8 @@ def _run_sync_validation_for_pmids(pmid_list: list):
             WHERE pmid IN ({placeholders})
               AND abstract IS NOT NULL AND abstract != ''
               AND pmid NOT IN (
-                  SELECT pmid FROM filter_log WHERE stage = 'hard_filter'
+                  SELECT pmid FROM filter_log
+                  WHERE stage IN ('hard_filter', 'needs_review')
               )
         """, pmid_list).fetchall()
     if not rows:
@@ -811,6 +658,18 @@ def _run_sync_validation_for_pmids(pmid_list: list):
         logger.warning(f"同步降级仍有 {len(remaining_rows)} 篇失败")
 
 
+def _log_research_field_stats() -> None:
+    """输出研究方向分布（全库口径，仅 RELEVANT 且有方向的记录）"""
+    with get_conn(DB_PATH) as conn:
+        counts = _count_research_fields(conn)
+    if not counts:
+        return
+    total = sum(counts.values())
+    logger.info("研究方向分布（仅 RELEVANT）:")
+    for field, cnt in counts.items():
+        logger.info(f"  {field:<12} {cnt:>6} 篇 ({cnt / total * 100:.1f}%)")
+
+
 def _export_failed_pmids_csv(failed_rows: list) -> Path | None:
     """导出最终验证失败的 PMID 列表"""
     if not failed_rows:
@@ -828,17 +687,69 @@ def _export_failed_pmids_csv(failed_rows: list) -> Path | None:
     return csv_path
 
 
-def _export_review_csv() -> Path | None:
-    """导出所有待人工复核的记录为 CSV"""
-    with get_conn(DB_PATH) as conn:
-        rows = conn.execute("""
-            SELECT v.pmid, a.title, a.abstract,
-                   v.llm_verdict, v.reason
+def _query_review_pending(db_path: Path | None = None) -> list:
+    """待人工复核清单：LLM 已验证未复核 + 摘要为空转人工（needs_review）。
+
+    两部分合并顺序刻意让"转人工"排在前面——它们从没被模型看过，
+    人工必须逐条读标题/期刊/年份才能判，先处理不易漏。
+
+    转人工行的 llm_verdict 填 NEEDS_REVIEW，避免与 RELEVANT/NOT_RELEVANT
+    混淆；reason 沿用硬过滤的 abstract_empty 便于追溯来源。
+    """
+    target_db = db_path or DB_PATH
+    with get_conn(target_db) as conn:
+        manual_rows = conn.execute("""
+            SELECT a.pmid, a.title, a.abstract, a.pub_year, a.journal,
+                   a.article_types, f.reason
+            FROM filter_log f
+            JOIN articles a ON a.pmid = f.pmid
+            WHERE f.stage = 'needs_review'
+              AND NOT EXISTS (
+                  SELECT 1 FROM llm_validation v WHERE v.pmid = a.pmid
+              )
+            ORDER BY a.pmid
+        """).fetchall()
+
+        llm_rows = conn.execute("""
+            SELECT v.pmid, a.title, a.abstract, a.pub_year, a.journal,
+                   a.article_types, v.llm_verdict, v.reason, v.research_field
             FROM llm_validation v
             JOIN articles a ON a.pmid = v.pmid
             WHERE v.human_review IS NULL
             ORDER BY v.llm_verdict DESC, a.pmid
         """).fetchall()
+
+    rows: list[dict] = []
+    for r in manual_rows:
+        rows.append({
+            "pmid": r["pmid"],
+            "title": r["title"],
+            "abstract": r["abstract"],
+            "pub_year": r["pub_year"],
+            "journal": r["journal"],
+            "article_types": r["article_types"],
+            "llm_verdict": NEEDS_REVIEW_VERDICT,
+            "reason": r["reason"],
+            "research_field": "",
+        })
+    for r in llm_rows:
+        rows.append({
+            "pmid": r["pmid"],
+            "title": r["title"],
+            "abstract": r["abstract"],
+            "pub_year": r["pub_year"],
+            "journal": r["journal"],
+            "article_types": r["article_types"],
+            "llm_verdict": r["llm_verdict"],
+            "reason": r["reason"],
+            "research_field": r["research_field"] or "",
+        })
+    return rows
+
+
+def _export_review_csv(db_path: Path | None = None) -> Path | None:
+    """导出所有待人工复核的记录为 CSV（含摘要为空转人工的文献）"""
+    rows = _query_review_pending(db_path)
 
     if not rows:
         logger.info("没有待复核的记录")
@@ -851,21 +762,22 @@ def _export_review_csv() -> Path | None:
 
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "pmid", "title", "abstract",
-            "llm_verdict", "reason", "human_review",
-        ])
+        writer.writerow(REVIEW_PENDING_FIELDS)
         for row in rows:
             writer.writerow([
                 row["pmid"],
                 row["title"],
                 row["abstract"] or "",
+                row["pub_year"] if row["pub_year"] is not None else "",
+                row["journal"] or "",
+                row["article_types"] or "",
                 row["llm_verdict"],
                 row["reason"],
+                row["research_field"],
                 "",
             ])
 
-    logger.info(f"待复核清单已导出: {csv_path}")
+    logger.info(f"待复核清单已导出: {csv_path}（{len(rows)} 篇）")
     logger.info("请人工标注 human_review 列为 Y 或 N（通过/驳回），然后运行 --step import-review")
     return csv_path
 
@@ -877,13 +789,15 @@ def _export_review_csv() -> Path | None:
 BATCH_CHECKPOINT_FILE = "llm_batch_progress.json"
 
 PROMPT_PREFIX = (
-    "请根据上述标准判断以下文献是否包含可用于马铃薯知识图谱构建的实体关系信息。\n\n"
+    "请根据上述标准判断以下文献是否以马铃薯（或其近缘种、块茎、病虫害、"
+    "加工产品等）为研究对象或重要研究材料，并对相关文献指定研究方向。\n\n"
 )
 
 PROMPT_OUTPUT_FORMAT = (
     '# 输出格式（仅输出如下 JSON，不要其他文字）：\n'
     '{"pmid": "%s", "verdict": "RELEVANT 或 NOT_RELEVANT", '
-    '"reason": "用中文简要说明判断依据"}'
+    '"reason": "用中文简要说明判断依据", '
+    '"research_field": "研究方向（仅当 verdict=RELEVANT 时填写，否则空字符串）"}'
 )
 
 
@@ -965,13 +879,16 @@ def _build_jsonl(rows: list) -> Path:
     return jsonl_path
 
 
-def _parse_batch_results(jsonl_path: str) -> tuple[int, list[str]]:
+def _parse_batch_results(jsonl_path: str, db_path: str | None = None) -> tuple[int, list[str]]:
     """
     解析 batch 输出结果 JSONL，写入 llm_validation 表。
     返回 (成功数, 失败 PMID 列表)。
+
+    db_path 仅供测试注入临时库；生产调用省略，走模块级 DB_PATH。
     """
     success_count = 0
     failed_pmids = []
+    target_db = db_path or DB_PATH
 
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
@@ -1041,10 +958,14 @@ def _parse_batch_results(jsonl_path: str) -> tuple[int, list[str]]:
                 failed_pmids.append(pmid)
                 continue
             reason = obj.get("reason", "")
+            research_field = _normalize_research_field(
+                obj.get("research_field"), verdict
+            )
             now = now_iso()
 
-            with get_conn(DB_PATH) as conn:
-                conn.execute(INSERT_SQL, (pmid, verdict, reason, now))
+            with get_conn(target_db) as conn:
+                conn.execute(INSERT_SQL,
+                             (pmid, verdict, reason, now, research_field))
             success_count += 1
 
     return success_count, failed_pmids
@@ -1095,7 +1016,8 @@ def _run_zhipu_batch():
             WHERE abstract IS NOT NULL AND abstract != ''
               AND pmid NOT IN (SELECT pmid FROM llm_validation)
               AND pmid NOT IN (
-                  SELECT pmid FROM filter_log WHERE stage = 'hard_filter'
+                  SELECT pmid FROM filter_log
+                  WHERE stage IN ('hard_filter', 'needs_review')
               )
         """).fetchall()
 
@@ -1296,6 +1218,8 @@ def _finalize_batch(chk: dict):
     for v, cnt in verdicts:
         logger.info(f"  {v}: {cnt} 篇 ({cnt / total * 100:.1f}%)")
 
+    _log_research_field_stats()
+
     csv_path_file = _export_review_csv()
     logger.info(f"LLM 验证完成，待复核清单: {csv_path_file}")
 
@@ -1304,6 +1228,12 @@ def import_human_review(csv_path: str | None = None):
     """
     导入人工复核结果 CSV，更新审核意见并导出最终过滤结果。
     未指定路径时自动使用最新的 llm_review_pending_*.csv。
+
+    两类行分开处理：
+    - 有 llm_validation 行（模型已判）：UPDATE human_review。
+    - 无 llm_validation 行（摘要为空转人工，verdict 为 NEEDS_REVIEW）：
+      人工结论是这篇文献唯一的判定，必须 INSERT 一行，否则
+      `_REVIEW_PASS_PREDICATE` 永远匹配不到它，判 Y 也导不出去。
     """
     out_dir = Path(OUTPUT_DIR)
     if csv_path:
@@ -1329,6 +1259,8 @@ def import_human_review(csv_path: str | None = None):
     rejected = 0
     skipped = 0
     updates = []
+    manual_rows = []
+    now = now_iso()
 
     with open(review_file, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
@@ -1341,7 +1273,18 @@ def import_human_review(csv_path: str | None = None):
             if review not in ("Y", "N"):
                 skipped += 1
                 continue
-            updates.append((review, pmid))
+            is_manual = (row.get("llm_verdict", "").strip().upper()
+                         == NEEDS_REVIEW_VERDICT)
+            if is_manual:
+                verdict = "RELEVANT" if review == "Y" else "NOT_RELEVANT"
+                field = _normalize_research_field(
+                    row.get("research_field", ""), verdict
+                )
+                manual_rows.append((pmid, verdict,
+                                    "人工复核判定（摘要为空，未经 LLM）",
+                                    now, field, review))
+            else:
+                updates.append((review, pmid))
             if review == "Y":
                 passed += 1
             else:
@@ -1350,14 +1293,20 @@ def import_human_review(csv_path: str | None = None):
     if updates:
         with get_conn(DB_PATH) as conn:
             conn.executemany(UPDATE_HUMAN_REVIEW_SQL, updates)
+    if manual_rows:
+        with get_conn(DB_PATH) as conn:
+            conn.executemany(INSERT_MANUAL_REVIEW_SQL, manual_rows)
 
     logger.info(f"导入完成: Y {passed} 篇, N {rejected} 篇, 跳过 {skipped} 行")
+    if manual_rows:
+        logger.info(f"其中摘要为空转人工 {len(manual_rows)} 篇（新建 llm_validation 记录）")
 
     filtered_csv = _export_filtered_csv()
     if filtered_csv:
         logger.info(f"最终过滤结果已导出: {filtered_csv}")
 
-    return {"passed": passed, "rejected": rejected, "skipped": skipped}
+    return {"passed": passed, "rejected": rejected, "skipped": skipped,
+            "manual_inserted": len(manual_rows)}
 
 
 # 复核通过谓词：human_review='Y' 或（未复核且 llm_verdict='RELEVANT'）。
@@ -1369,18 +1318,53 @@ _REVIEW_PASS_PREDICATE = (
 )
 
 
-def _export_filtered_csv() -> Path | None:
-    """导出 LLM 验证 + 人工复核后的最终结果"""
-    with get_conn(DB_PATH) as conn:
-        rows = conn.execute(f"""
+FILTERED_EXPORT_FIELDS = [
+    "pmid", "title", "abstract", "keywords", "mesh_terms",
+    "pub_year", "journal", "doi", "pmc_id",
+    "article_types", "authors", "affiliation", "language",
+    "llm_verdict", "llm_reason", "research_field", "human_review",
+]
+
+
+def _query_filtered_export(db_path: Path | None = None,
+                           since_timestamp: str | None = None,
+                           *, order_by_validated_at: bool = False) -> list:
+    """filtered 导出共用查询：列清单与复核谓词单一来源（与 raw 导出同谓词）。
+
+    比 raw 导出多出 llm_verdict / reason / research_field / human_review 四列，
+    研究方向分类只在这条路径上。
+
+    db_path 默认 None 走模块级 DB_PATH（不在签名里绑定默认值，否则测试里
+    patch mod.DB_PATH 会失效）。
+    """
+    target_db = db_path or DB_PATH
+    sql = f"""
             SELECT a.pmid, a.title, a.abstract, a.keywords, a.mesh_terms,
                    a.pub_year, a.journal, a.doi, a.pmc_id,
                    a.article_types, a.authors, a.affiliation, a.language,
-                   v.llm_verdict, v.reason, v.human_review
+                   v.llm_verdict, v.reason, v.research_field, v.human_review
             FROM articles a
             JOIN llm_validation v ON a.pmid = v.pmid
             WHERE {_REVIEW_PASS_PREDICATE}
-        """).fetchall()
+        """
+    params: list = []
+    if since_timestamp:
+        sql += "\n              AND v.validated_at > ?"
+        params.append(since_timestamp)
+    if order_by_validated_at:
+        sql += "\n            ORDER BY v.validated_at"
+    with get_conn(target_db) as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def _export_filtered_csv(db_path: Path | None = None,
+                         since_timestamp: str | None = None,
+                         *, order_by_validated_at: bool = False) -> Path | None:
+    """导出 LLM 验证 + 人工复核后的最终结果（含研究方向分类）
+
+    db_path / since_timestamp 供测试与增量路径注入；生产全量导出省略参数。
+    """
+    rows = _query_filtered_export(db_path, since_timestamp, order_by_validated_at=order_by_validated_at)
 
     if not rows:
         logger.info("没有符合条件的最终结果")
@@ -1389,16 +1373,13 @@ def _export_filtered_csv() -> Path | None:
     out_dir = Path(OUTPUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = out_dir / f"llm_filtered_{ts}.csv"
+    if since_timestamp:
+        suffix = f"_since_{since_timestamp.replace(':', '-').replace('T', '_')}"
+        csv_path = out_dir / f"llm_filtered_incremental{suffix}_{ts}.csv"
+    else:
+        csv_path = out_dir / f"llm_filtered_{ts}.csv"
 
-    fieldnames = [
-        "pmid", "title", "abstract", "keywords", "mesh_terms",
-        "pub_year", "journal", "doi", "pmc_id",
-        "article_types", "authors", "affiliation", "language",
-        "llm_verdict", "llm_reason", "human_review",
-    ]
-
-    _write_dict_csv(csv_path, fieldnames, rows,
+    _write_dict_csv(csv_path, FILTERED_EXPORT_FIELDS, rows,
                     transform=_rename_reason_to_llm_reason)
 
     logger.info(f"最终过滤结果: {csv_path} ({len(rows)} 篇)")
@@ -1528,4 +1509,39 @@ def export_incremental_raw_csv(since_timestamp: str = None, db_path: Path = DB_P
     _write_dict_csv(csv_path, RAW_EXPORT_FIELDS, rows)
 
     logger.info(f"增量导出原始文献信息: {csv_path} ({len(rows)} 篇, since={since_timestamp})")
+    return csv_path
+
+
+def export_incremental_filtered_csv(since_timestamp: str = None,
+                                    db_path: Path | None = None) -> Path | None:
+    """增量导出：带研究方向分类的最终结果（与 export_incremental_raw_csv 同时段）
+
+    参数与告警语义同 export_incremental_raw_csv，只是列集换成
+    FILTERED_EXPORT_FIELDS（多出 llm_verdict / llm_reason / research_field /
+    human_review）。
+    """
+    rows = _query_filtered_export(db_path, since_timestamp, order_by_validated_at=True)
+
+    if not rows:
+        logger.info(f"增量导出（含研究方向）: 无新增符合条件的记录 (since={since_timestamp})")
+        return None
+
+    if since_timestamp:
+        total = _count_exportable(db_path or DB_PATH)
+        if len(rows) >= total:
+            logger.warning(
+                f"增量导出（含研究方向）条数 {len(rows)} 等于可导出总数 {total}："
+                f"时间戳 {since_timestamp} 早于全部文献的验证时间，本次并非真正的增量导出。"
+            )
+
+    out_dir = Path(OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    suffix = f"_since_{since_timestamp.replace(':', '-').replace('T', '_')}" if since_timestamp else ""
+    csv_path = out_dir / f"llm_filtered_incremental{suffix}_{ts}.csv"
+
+    _write_dict_csv(csv_path, FILTERED_EXPORT_FIELDS, rows,
+                    transform=_rename_reason_to_llm_reason)
+
+    logger.info(f"增量导出（含研究方向）: {csv_path} ({len(rows)} 篇, since={since_timestamp})")
     return csv_path

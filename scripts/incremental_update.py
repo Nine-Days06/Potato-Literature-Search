@@ -36,7 +36,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from downloader.incremental_downloader import run_incremental_download, get_removed_pmids
 from parser.xml_parser import run_parse
 from cleaner.hard_filter import run_incremental_hard_filter, mark_removed_pmids
-from cleaner.llm_validator import run_validation, export_incremental_raw_csv
+from cleaner.llm_validator import (
+    run_validation,
+    export_incremental_raw_csv,
+    export_incremental_filtered_csv,
+)
 from config.settings import RAW_XML_DIR, DB_PATH, LOG_DIR
 from utils.db import init_db
 from utils.logger import get_logger
@@ -230,6 +234,10 @@ def main():
             logger.info(f"增量导出完成: {path}")
         else:
             logger.info("增量导出: 无新增数据")
+
+        filtered_path = export_incremental_filtered_csv(since)
+        if filtered_path:
+            logger.info(f"增量导出（含研究方向）完成: {filtered_path}")
 
     logger.info("=" * 60)
     logger.info("✅ 增量更新流水线完成")

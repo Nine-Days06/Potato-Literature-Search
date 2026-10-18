@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS articles (
 CREATE_FILTER_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS filter_log (
     pmid          TEXT PRIMARY KEY,
-    stage         TEXT,       -- 'hard_filter'(排除) / 'hard_filter_pass'(通过) / 'query_removed'(查询词移除) / 'relevance'
+    stage         TEXT,       -- 'hard_filter'(排除) / 'hard_filter_pass'(通过)
+                              -- 'needs_review'(摘要为空，转人工，不进 LLM)
+                              -- 'query_removed'(查询词移除) / 'relevance'
     reason        TEXT,       -- 被过滤的原因
     filtered_at   TEXT        -- ISO 时间戳
 );
@@ -43,13 +45,31 @@ CREATE TABLE IF NOT EXISTS llm_validation (
     llm_verdict      TEXT,      -- RELEVANT / NOT_RELEVANT
     reason           TEXT,      -- LLM 判断理由
     validated_at     TEXT,      -- 验证时间
-    human_review     TEXT       -- NULL=待复核, Y=通过, N=驳回
+    human_review     TEXT,      -- NULL=待复核, Y=通过, N=驳回
+    research_field   TEXT       -- 研究方向（config/settings.py RESEARCH_FIELDS）；仅 RELEVANT 填
 );
 """
 
+# 增量列迁移：(表名, 列名, 列定义)
+# 老库靠 CREATE TABLE IF NOT EXISTS 不会补列，必须显式 ALTER TABLE。
+# 新增列时在此追加一条，已有库下次 init_db() 自动补齐。
+_ADDED_COLUMNS = [
+    ("llm_validation", "research_field", "TEXT"),
+]
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """为已存在的老库补齐新增列（幂等：列已存在则跳过）"""
+    for table, column, coltype in _ADDED_COLUMNS:
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue          # 表尚未创建，由 CREATE 语句负责
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
 
 def init_db(db_path: Path) -> None:
-    """初始化数据库，创建所有表"""
+    """初始化数据库，创建所有表并补齐新增列"""
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     # 注意：sqlite3 连接作为上下文管理器只管理事务、不关闭连接，
@@ -59,6 +79,7 @@ def init_db(db_path: Path) -> None:
         conn.execute(CREATE_ARTICLES_SQL)
         conn.execute(CREATE_FILTER_LOG_SQL)
         conn.execute(CREATE_LLM_VALIDATION_SQL)
+        _migrate_schema(conn)
         conn.commit()
     finally:
         conn.close()

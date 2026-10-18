@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # main.py
 """
 马铃薯文献批量下载与清洗系统 — 一键运行入口
@@ -68,10 +68,23 @@ def step_import_review(csv_path: str = None):
 
 
 def step_export():
-    from cleaner.llm_validator import _export_raw_csv
-    path = _export_raw_csv()
-    if path:
-        logger.info(f"原始文献信息已导出: {path}")
+    """导出两份 CSV：
+
+    1. articles_raw_*.csv —— 仅 articles 原生字段，供下游流程使用；
+    2. llm_filtered_*.csv —— 附加 llm_verdict / llm_reason / research_field /
+       human_review，研究方向分类在这一份里。
+
+    两份的筛选条件一致（_REVIEW_PASS_PREDICATE）。
+    """
+    from cleaner.llm_validator import _export_raw_csv, _export_filtered_csv
+
+    raw_path = _export_raw_csv()
+    if raw_path:
+        logger.info(f"原始文献信息已导出: {raw_path}")
+
+    filtered_path = _export_filtered_csv()
+    if filtered_path:
+        logger.info(f"带研究方向分类的导出: {filtered_path}")
 
 
 def main():

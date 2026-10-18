@@ -1,13 +1,14 @@
 # 马铃薯文献批量下载与清洗系统
 
-基于 NCBI E-utilities API，批量下载 PubMed 中马铃薯相关文献（覆盖胁迫、发育、基因调控、多组学、功能遗传学等方向），
+基于 NCBI E-utilities API，批量下载 PubMed 中全部马铃薯相关文献（不限研究方向：分子生物学、遗传育种、栽培生理、植物保护、加工储藏、品质营养等），
 经过解析、去重、质量过滤、LLM 二次验证，最终产出结构化数据集，
 用于知识图谱构建或智能体效果评测。
 
 ## 特性
 
 - **并发下载** — XML 批次下载自动并发（`ThreadPoolExecutor` + 全局速率限制器），充分发挥 NCBI API 配额
-- **二级过滤** — 硬过滤（规则引擎）→ LLM 验证（多 Provider）
+- **自适应日期切分** — 命中超阈值自动对半递归细分（年→月→日），规避 NCBI `retstart` 10000 硬上限导致的静默截断
+- **二级过滤** — 硬过滤（规则引擎：标题空/去重排除，摘要空转人工）→ LLM 验证（多 Provider，相关性判定 + 研究方向分类）
 - **断点续传** — XML 批次自动跳过已下载文件；LLM 验证崩溃后可恢复；PDF 下载失败可 `--step pdf-retry` 续跑
 - **多 Provider** — 支持 DeepSeek、智谱 GLM、OpenAI 兼容 API 三种 LLM 后端
 - **智谱 Batch API** — 异步批量验证，支持中断恢复与自动降级同步模式重试
@@ -40,7 +41,7 @@ Potato-Literature-Search/
 │   └── xml_parser.py            # XML 解析 → SQLite（复用单连接写入）
 ├── cleaner/
 │   ├── __init__.py
-│   ├── hard_filter.py           # 硬过滤（语言/摘要/年份/类型/标题/去重）
+│   ├── hard_filter.py           # 硬过滤（标题空/去重排除，摘要空转人工审核）
 │   └── llm_validator.py         # LLM 二次验证（支持 DeepSeek / Zhipu / OpenAI）
 ├── utils/
 │   ├── __init__.py              # now_iso() 工具函数
@@ -75,11 +76,11 @@ flowchart LR
     end
 
     subgraph 清洗
-        H[硬过滤<br>语言/年份/类型/去重]
+        H[硬过滤<br>标题空/去重排除<br>摘要空转人工]
     end
 
     subgraph 进阶
-        I[LLM 二次验证<br>DeepSeek/Zhipu/OpenAI] --> J[人工复核<br>导入 Y/N]
+        I[LLM 二次验证<br>相关性判定 + 研究方向分类] --> J[人工复核<br>导入 Y/N]
         J --> K[最终过滤结果]
         L[PDF 全文下载<br>PMC OA] --> M[aria2c 并发下载]
     end
@@ -93,6 +94,81 @@ flowchart LR
 
 > **注意**：`--step all`（默认）仅执行 **下载 → 解析 → 清洗**（硬过滤）。
 > LLM 验证、导入复核、PDF 下载为独立步骤，需通过对应 `--step` 参数单独执行。
+
+### 过滤与分类规则
+
+**硬过滤（规则引擎）** 只保留记录完整性相关的机械规则，并含一条**转人工**分支：
+
+| 规则 | stage | reason | 说明 |
+|------|-------|--------|------|
+| 重复标题 | `hard_filter` | `duplicate_title` | 同 `(title, journal, pub_year)` 保留最小 PMID，优先级最高 |
+| 标题为空 | `hard_filter` | `title_empty` | 空白串亦算空 |
+| 摘要为空 | `needs_review` | `abstract_empty` | 空白串亦算空；**不排除、不进 LLM**，直接转人工复核 |
+
+判定优先级：重复标题 > 标题为空 > 摘要为空，同时命中只写一条记录。
+
+**摘要为空为什么转人工而不是排除**：这类文献绝大多数是 PubMed 早期（1940–1980）无摘要字段年代的记录，或 Letter/简讯/勘误类短文；模型只能看标题，判定不可靠。它们会以 `llm_verdict='NEEDS_REVIEW'` 出现在 `llm_review_pending_*.csv` 里，由人工判 Y/N，判完即写入 `llm_validation` 并进入正常导出链路。
+
+已在 2026-10 取消的规则**不要加回**：语言非英文、摘要 `<80` 字符、发表年份越界、文章类型黑名单（Letter/Editorial/Comment 等）、标题 `<10` 字符。
+这些维度改由 LLM 二次验证承担——非英文、短摘要、Letter 类文献同样可能是相关研究。
+
+**研究方向分类**：LLM 验证对判定为 `RELEVANT` 的文献额外输出 `research_field`，取值限定为 `config/settings.py` 中 `RESEARCH_FIELDS` 的十项封闭枚举：
+
+分子生物学 / 遗传育种 / 栽培生理 / 植物保护 / 加工储藏 / 品质营养 / 产后处理 / 产业经济 / 综述评论 / 其他
+
+`NOT_RELEVANT` 的方向留空；方向缺失或越界时回落 `其他`，不会因此判定失败重试。
+
+**LLM 提示词规则**：系统提示词由三块规则组成，均经 300 篇真实文献基准集 A/B 测试确定（见下节）：
+
+1. **核心判定**——文献是否以马铃薯（或其近缘种、块茎/植株/种质资源、病虫害互作、加工产品）为研究对象或重要研究材料；正向覆盖全部研究方向，负向明确 `sweet potato / Ipomoea batatas`（甘薯）为主要研究对象时排除。
+2. **顺带提及判定**——通用方法/多物种并列/仅作对照背景/名称陷阱四类一律 `NOT_RELEVANT`，配两条判定问句（「去掉马铃薯结论是否仍成立」）。
+3. **输出前自检**——先回答 Q1（是否核心研究对象）、Q2（是否仅出现在列表/对比/背景），理由与结论不得矛盾。
+
+**未启用**的两块规则：**默认倾向**（证据不足倾向排除，实测会漏收边缘正例）与**物种甄别**（显式列举甘薯/木薯/番茄/非马铃薯 Solanum，对 glm 收益大但对当前生产的 deepseek 会多误排正例）。详见下方选型理由。
+
+**提示词基准测试**：`bench_run.py` + `bench_analyze.py` + `bench_prompts.py` 用 300 篇历史复核文献做量化对比。
+
+> **每个版本必须跑 3 次取多数票。** 实测即使 `temperature=0`，同一提示词连续两次运行的判定翻转率也有 2.4–2.7%；单次运行的差异会把随机噪声伪装成提示词效果。投票后三票一致率 96–98%，仍有约 3% 样本在边界上摇摆。
+
+干净金标准集（`pos` 层 150 篇人工确认 Y + `sweet_potato_mention` 层 30 篇明确该排除，共 180 篇，不受收录标准变更污染）上的**配对口径**准确率（只统计该模型下各版本都有结果的样本，避免限流导致样本数不等而比较不同难度子集）：
+
+| 版本 | 规则 | glm-4-Flash | deepseek-v4.1-flash | 跨模型平均 | 跨模型最差 |
+|------|------|-------------|---------------------|-----------|-----------|
+| V1 | 无规则（删示例后状态） | 0.9576 | 0.9944 | 0.9760 | 0.9576 |
+| V2 | +顺带提及规则 | 0.9636 | 0.9889 | 0.9763 | 0.9636 |
+| **V3（当前生产版本）** | **+输出前自检** | **0.9879** | **0.9944** | **0.9912** | **0.9879** |
+| V4 | V3+默认倾向 | 0.9818 | 0.9889 | 0.9854 | 0.9818 |
+| V5 | V3+物种甄别 | 0.9879 | 0.9889 | 0.9884 | 0.9879 |
+| V6 | V5+默认倾向 | 0.9818 | 0.9944 | 0.9881 | 0.9818 |
+| V7 | V3+修正版物种甄别 | 0.9706 | 0.9944 | 0.9825 | 0.9706 |
+
+全 300 篇（含历史 N 标签，严格口径，仅参考）准确率 V3 为 glm 0.743 / deepseek 0.807。
+
+**选型理由**：V3 的跨模型平均（0.9912）与最差（0.9879）均为 7 个版本中最高，且提示词最短（1842 字符，比 V5 少 506 字符）：
+
+- V3 与 V5 在 glm 上完全打平（均 0.9879），在 deepseek 上 V3 略高（0.9944 vs 0.9889）。两者实际分歧只有 3 篇：glm 上 V3 多错 1 篇甘薯（42066814，IbGBSS1 甘薯 CRISPR）、V5 多错 1 篇正例（39271954，Solanum 糖苷生物碱）；deepseek 上 V5 多错 1 篇正例（31277248，PIN 生长素转运蛋白，标题明确含 "in Solanum tuberosum"）。
+- 物种甄别块对 glm 有实质收益（甘薯误收 0.9333→0.9667，全库预估误收 112→56 篇），但对 deepseek 无增量甚至有害（V1 基线甘薯误收已是 3%）。当前生产用 deepseek，取 V3 的零真错。
+- V7 实验证伪了「删掉物种甄别块里那句矛盾规则」的想法：删掉「其他 Solanum 属非马铃薯物种一律排除」后，glm 上甘薯误收反弹到 4/30（0.9706）。**那句话是物种甄别块的严格性锚点，删不得**——若将来切回 glm，应直接启用 V5 而非修 V5。
+- 不启用「默认倾向」（V4/V6）：它会让**实验宿主是番茄、研究对象却是马铃薯病原**的文献被误排（如 PSTVd 马铃薯纺锤块茎类病毒，deepseek 上 V6 因此漏收 PMID 32719659）。漏收比误收更难发现。
+
+**复现方式**：
+
+```bash
+python bench_run.py --repeat=3      # 每版本跑 3 遍，多数票合并
+python bench_analyze.py             # 两模型结果并排对比，含配对口径表
+```
+
+各次原始运行缓存在 `bench_out/_run{i}_<版本>__<模型>.json`，主结果按模型分文件（`bench_results_<版本>__<provider>-<model>.json`），切换模型不会互相覆盖。
+
+**历史数据迁移**：取消规则前留下的排除记录需要清理，否则相关文献永远进不了 LLM 验证。
+
+```bash
+python scripts/migrate_relax_hard_filter.py           # 先看会清理多少（dry-run）
+python scripts/migrate_relax_hard_filter.py --apply   # 确认后写库
+python scripts/incremental_update.py --validate --export   # 重跑，补上研究方向
+```
+
+迁移只删由**已取消规则**写下的 `filter_log` 排除记录，以及 `human_review IS NULL` 的 `llm_validation` 记录；人工复核过（Y/N）的结论一律保留。
 
 ## 快速开始
 
@@ -109,14 +185,19 @@ pip install -r requirements.txt
 python main.py
 
 # 4. LLM 二次验证
-#    config/settings.py 中 LLM_PROVIDER 可选 "deepseek" / "zhipu" / "openai"
-#    对应在 .env 中设置 DEEPSEEK_API_KEY / ZHIPU_API_KEY / OPENAI_API_KEY
+#    在 config/.env 中设置 LLM_PROVIDER（"deepseek" / "zhipu" / "openai"）
+#    以及对应 provider 的 API Key，无需改动 settings.py
 python main.py --step validate
 
 # 5. 导入人工复核结果（在导出的 CSV 中标注 Y/N 后）
+#    复核清单里 llm_verdict='NEEDS_REVIEW' 的行是摘要为空转人工的文献，
+#    判 Y/N 后会新建 llm_validation 行，同样进入导出链路
 python main.py --step import-review
 
-# 5.1 导出复核通过文献的原始信息（不含 LLM 判断与人工复核列）
+# 5.1 导出复核通过文献（同时产出两份 CSV）
+#     articles_raw_*.csv     仅 articles 原生字段
+#     llm_filtered_*.csv     附加 llm_verdict / llm_reason / research_field / human_review
+#     研究方向分类在 llm_filtered_*.csv 里
 python main.py --step export
 
 # 批量验证（智谱专用，异步处理大文献集）
@@ -157,7 +238,7 @@ python main.py --step import-review
 # 指定复核文件
 python main.py --step import-review --csv data/output/llm_review_pending_20250101_120000.csv
 
-# 导出复核通过文献的原始信息 CSV（pmid/title/abstract 等全部原始字段，无 LLM/复核列）
+# 导出复核通过文献（articles_raw_*.csv 原始字段 + llm_filtered_*.csv 含研究方向分类）
 python main.py --step export
 
 # 自定义搜索词
@@ -175,15 +256,37 @@ python main.py --query "potato AND drought AND gene"
 | `--csv` | import-review | 人工复核 CSV 文件路径（默认自动查找最新文件） |
 | `--skip-filter` | 增量更新 | 跳过硬过滤阶段（仅 `scripts/incremental_update.py`） |
 
+### LLM 配置（全部通过 `config/.env` 覆盖）
+
+模型与并发等参数不再写死在 `config/settings.py` 里，改 `.env` 即可切换，无需动源码。
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `LLM_PROVIDER` | `openai` | `deepseek` / `zhipu` / `openai`（openai 指 OpenAI 兼容协议，可指向任意网关） |
+| `OPENAI_BASE_URL` | `http://127.0.0.1:3425/v1` | OpenAI 兼容网关地址 |
+| `OPENAI_MODEL` | `group/ds4.1` | 网关上的模型名 |
+| `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` | `https://api.deepseek.com` / `deepseek-v4-flash` | DeepSeek 官方 |
+| `ZHIPU_MODEL` / `ZHIPU_BATCH_MODEL` | `glm-4-Flash-250414` / `glm-4-flash` | 智谱同步 / Batch |
+| `LLM_BATCH_SIZE` | 5 | 每次 API 调用携带的文献数 |
+| `LLM_CONCURRENCY` | 2 | 并行批次数（本地网关建议 2–4） |
+| `LLM_MAX_TOKENS` | 8192 | 单次调用最大输出 token |
+| `LLM_TIMEOUT` | 120 | 单次调用超时（秒） |
+| `LLM_MAX_RETRIES` | 3 | 单次调用重试次数（指数退避 2s/4s/8s） |
+| `LLM_MAX_ROUNDS` | 2 | 整轮重试次数（初始 1 轮 + 额外轮数） |
+| `LLM_BATCH_POLL_INTERVAL` / `LLM_BATCH_TIMEOUT` / `LLM_BATCH_AUTO_DELETE` | 30 / 86400 / true | 仅智谱 Batch 模式 |
+
+空值（`KEY=`）等同于未设置，会回退到默认值；`LLM_PROVIDER` 拼错会在导入时直接报错。
+
 ## 输出文件
 
 | 文件 | 说明 |
 |------|------|
 | `data/processed/potato_lit.db` | 全量结构化文献库（articles + filter_log + llm_validation 三张表） |
-| `data/output/llm_review_pending_*.csv` | LLM 验证待人工复核清单（标注 Y/N） |
+| `data/output/llm_review_pending_*.csv` | 待人工复核清单（10 列，含 `pub_year` / `journal` / `article_types` 便于无摘要文献判断；`llm_verdict='NEEDS_REVIEW'` 的行是摘要为空转人工的文献），标注 Y/N 后用 `--step import-review` 导回 |
 | `data/output/llm_validation_failed_*.csv` | LLM 校验失败 PMID 清单 |
-| `data/output/llm_filtered_*.csv` | LLM + 人工复核后的最终过滤结果 |
-| `data/output/articles_raw_*.csv` | 复核通过文献的原始信息（不含 raw_xml_file、LLM/复核列） |
+| `data/output/llm_filtered_*.csv` | **交付主文件**：LLM + 人工复核后的最终结果，含 `llm_verdict` / `llm_reason` / `research_field` / `human_review` 四列 |
+| `data/output/articles_raw_*.csv` | 复核通过文献的原始信息（不含 raw_xml_file、LLM/复核列），供下游流程使用 |
+| `data/output/llm_filtered_incremental_*.csv` | **增量导出**：指定时间后新增的复核通过文献，带 `research_field` 研究方向列 |
 | `data/output/articles_raw_incremental_*.csv` | **增量导出**：指定时间后新增的复核通过文献原始信息 |
 | `data/output/failed_downloads_*.csv` | PDF 下载失败链接清单（供 `--step pdf-retry` 续跑） |
 | `data/output/pdf_download_progress.json` | PDF 重试断点（中断后自动恢复） |
@@ -235,8 +338,8 @@ python scripts/incremental_update.py --year-max 2026
 |------|----------|
 | **下载** | 对比 `pmid_list.json`，仅下载 `新查询词结果 - 旧结果` 的差集 PMID |
 | **解析** | `INSERT OR IGNORE` 自动去重，无需额外处理 |
-| **硬过滤** | 仅处理 `filter_log` 中无任何记录的真正新增 PMID；通过者写入 `stage='hard_filter_pass'` 标记，历史已验证文献自动回填，重复标题全量对比但只标记新增 |
-| **LLM 验证** | 原生跳过已验证/已过滤 PMID，自动增量 |
+| **硬过滤** | 仅处理 `filter_log` 中无任何记录的真正新增 PMID；通过者写入 `stage='hard_filter_pass'`，摘要为空者写入 `stage='needs_review'`（转人工，不进 LLM），历史已验证文献自动回填，重复标题全量对比但只标记新增 |
+| **LLM 验证** | 原生跳过已验证 / 已排除（`hard_filter`）/ 转人工（`needs_review`）PMID，自动增量 |
 | **导出** | 按 `validated_at` 时间戳筛选，文件名含 `incremental` 标识 |
 
 > **注意**：增量下载会更新 `data/raw_xml/pmid_list.json`（覆盖为新查询词的全量 PMID 列表），旧数据库记录保留，通过 `filter_log.stage='query_removed'` 标记被新查询词排除的旧 PMID。
