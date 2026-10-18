@@ -40,6 +40,7 @@ from cleaner.llm_validator import (
     run_validation,
     export_incremental_raw_csv,
     export_incremental_filtered_csv,
+    export_by_research_field,
 )
 from config.settings import RAW_XML_DIR, DB_PATH, LOG_DIR
 from utils.db import init_db
@@ -238,6 +239,10 @@ def main():
         filtered_path = export_incremental_filtered_csv(since)
         if filtered_path:
             logger.info(f"增量导出（含研究方向）完成: {filtered_path}")
+
+        field_paths = export_by_research_field(since_timestamp=since)
+        if field_paths:
+            logger.info(f"按研究方向拆分导出: {len(field_paths)} 个文件")
 
     logger.info("=" * 60)
     logger.info("✅ 增量更新流水线完成")

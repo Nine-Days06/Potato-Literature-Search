@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config.settings import (
-    DB_PATH, RAW_XML_DIR, OUTPUT_DIR, LOG_DIR
+    DB_PATH, RAW_XML_DIR, OUTPUT_DIR, OUTPUT_SUBDIRS, LOG_DIR
 )
 from utils.db import init_db
 from utils.logger import get_logger
@@ -68,15 +68,21 @@ def step_import_review(csv_path: str = None):
 
 
 def step_export():
-    """导出两份 CSV：
+    """导出三份 CSV：
 
     1. articles_raw_*.csv —— 仅 articles 原生字段，供下游流程使用；
     2. llm_filtered_*.csv —— 附加 llm_verdict / llm_reason / research_field /
-       human_review，研究方向分类在这一份里。
+       human_review，研究方向分类在这一份里；
+    3. by_field/<方向>/ —— 第 2 份按 research_field 拆成一方向一目录，每个
+       目录放两份：llm_filtered_by_field_<方向>_*.csv（同 2 的 17 列）与
+       articles_raw_by_field_<方向>_*.csv（同 1 的 15 列，不含 LLM 信息）；
+       另附 llm_filtered_by_field_index_*.csv 记录各方向篇数、目录与两份文件名。
 
-    两份的筛选条件一致（_REVIEW_PASS_PREDICATE）。
+    三份的筛选条件一致（_REVIEW_PASS_PREDICATE）。
     """
-    from cleaner.llm_validator import _export_raw_csv, _export_filtered_csv
+    from cleaner.llm_validator import (
+        _export_raw_csv, _export_filtered_csv, export_by_research_field,
+    )
 
     raw_path = _export_raw_csv()
     if raw_path:
@@ -85,6 +91,11 @@ def step_export():
     filtered_path = _export_filtered_csv()
     if filtered_path:
         logger.info(f"带研究方向分类的导出: {filtered_path}")
+
+    field_paths = export_by_research_field()
+    if field_paths:
+        logger.info(f"按研究方向拆分导出: {len(field_paths)} 个文件"
+                    f"（每个方向目录内含 LLM 版 + raw 版）")
 
 
 def main():
@@ -120,7 +131,9 @@ def main():
     args = parser.parse_args()
 
     # 初始化目录和数据库
-    for d in [RAW_XML_DIR, OUTPUT_DIR, LOG_DIR, DB_PATH.parent]:
+    output_dirs = [RAW_XML_DIR, OUTPUT_DIR, LOG_DIR, DB_PATH.parent]
+    output_dirs += [OUTPUT_DIR / sub for sub in OUTPUT_SUBDIRS]
+    for d in output_dirs:
         d.mkdir(parents=True, exist_ok=True)
     init_db(DB_PATH)
 

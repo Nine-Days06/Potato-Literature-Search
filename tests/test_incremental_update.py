@@ -44,6 +44,8 @@ class TestStageSelection(unittest.TestCase):
                           side_effect=rec("export", Path("out.csv"))), \
              patch.object(iu, "export_incremental_filtered_csv",
                           side_effect=rec("export_filtered", Path("out_filtered.csv"))), \
+             patch.object(iu, "export_by_research_field",
+                          side_effect=rec("export_by_field", [Path("out_植物保护.csv")])), \
              patch.object(iu, "get_removed_pmids", side_effect=rec("removed", set())), \
              patch.object(iu, "mark_removed_pmids"):
             iu.main()
@@ -99,7 +101,7 @@ class TestStageSelection(unittest.TestCase):
         self.assertTrue(calls.get("validate"))
 
     def test_export_since_passes_timestamp_through(self):
-        """时间戳必须原样传给两个导出函数（raw 与 filtered 同时段）"""
+        """时间戳必须原样传给三个导出函数（raw / filtered / 按方向）"""
         seen = {}
 
         def fake_export(since=None, db_path=None):
@@ -110,6 +112,10 @@ class TestStageSelection(unittest.TestCase):
             seen["since_filtered"] = since
             return Path("out_filtered.csv")
 
+        def fake_export_by_field(db_path=None, since_timestamp=None):
+            seen["since_by_field"] = since_timestamp
+            return [Path("out_植物保护.csv")]
+
         with patch.object(sys, "argv", ["incremental_update.py",
                                         "--export-since", "2025-08-01T00:00:00"]), \
              patch.object(iu, "init_db"), \
@@ -118,17 +124,21 @@ class TestStageSelection(unittest.TestCase):
              patch.object(iu, "run_incremental_hard_filter"), \
              patch.object(iu, "export_incremental_raw_csv", side_effect=fake_export), \
              patch.object(iu, "export_incremental_filtered_csv",
-                          side_effect=fake_export_filtered):
+                          side_effect=fake_export_filtered), \
+             patch.object(iu, "export_by_research_field",
+                          side_effect=fake_export_by_field):
             iu.main()
 
         self.assertEqual(seen.get("since"), "2025-08-01T00:00:00")
         self.assertEqual(seen.get("since_filtered"), "2025-08-01T00:00:00")
+        self.assertEqual(seen.get("since_by_field"), "2025-08-01T00:00:00")
 
-    def test_export_emits_both_raw_and_filtered(self):
-        """--export 必须同时产出 raw 与带研究方向的 filtered 两份"""
+    def test_export_emits_raw_filtered_and_by_field(self):
+        """--export 必须同时产出 raw、带研究方向的 filtered、按方向拆分三份"""
         calls = self._run(["--export"])
         self.assertTrue(calls.get("export"))
         self.assertTrue(calls.get("export_filtered"))
+        self.assertTrue(calls.get("export_by_field"))
 
 
 if __name__ == "__main__":

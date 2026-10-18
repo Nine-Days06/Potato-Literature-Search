@@ -23,7 +23,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import (
     DB_PATH, PMC_S3_URL, PDF_DIR,
-    REQUEST_INTERVAL, OUTPUT_DIR, PROXY, LOG_DIR
+    REQUEST_INTERVAL, OUTPUT_DIR, PROXY, LOG_DIR,
+    SUBDIR_FAILURE, SUBDIR_CACHE,
 )
 from utils.db import get_conn
 from utils.logger import get_logger
@@ -40,6 +41,15 @@ ARIA2C_SPLIT = "8"
 ARIA2C_MIN_SPLIT_SIZE = "1M"
 PDF_CHECKPOINT_FILENAME = "pdf_download_progress.json"
 RETRY_CHECKPOINT_INTERVAL = 10
+
+
+def _output_dir(subdir: str) -> Path:
+    """按**调用时**的模块级 OUTPUT_DIR 派生子目录。
+
+    不能写成 `OUTPUT_DIR / subdir` 的模块级常量：测试靠 patch
+    模块属性 `OUTPUT_DIR` 重定向输出，常量在 import 期就固化了。
+    """
+    return Path(OUTPUT_DIR) / subdir
 
 # ── API 调用与解析 ───────────────────────────────────────────
 
@@ -287,16 +297,19 @@ def _fetch_single_oa_link(pmc_id: str) -> tuple[str, dict[str, str] | None, str]
 
 def load_cached_oa_links(
     pmc_ids: list[str],
-    out_dir: Path = OUTPUT_DIR,
+    out_dir: Path | None = None,
 ) -> dict[str, dict[str, str]]:
     """
     从历史导出的 OA 链接清单中加载可复用链接。
     只返回当前 `pmc_ids` 范围内的记录。
     跳过已失效的 FTP 链接（NCBI FTP 路径已于 2026-08 删除）。
+
+    out_dir 省略时取 OUTPUT_DIR/cache（OA 链接清单属于中间件，不是交付件）。
     """
     if not pmc_ids:
         return {}
 
+    out_dir = Path(out_dir) if out_dir else _output_dir(SUBDIR_CACHE)
     target_ids = set(pmc_ids)
     cached_links: dict[str, dict[str, str]] = {}
     csv_files = sorted(out_dir.glob(OA_LINKS_CACHE_GLOB), reverse=True)
@@ -406,11 +419,15 @@ def fetch_oa_links(
 def export_oa_links_csv(
     oa_links: dict[str, dict[str, str]],
     pmc_to_info: dict[str, dict[str, str]],
-    out_dir: Path = OUTPUT_DIR,
+    out_dir: Path | None = None,
 ) -> Path:
     """
     导出本次获取到的 OA 下载链接清单（CSV）。
+
+    默认写入 OUTPUT_DIR/cache：这份清单的唯一用途是被
+    `load_cached_oa_links` 复用，不是交付给用户的产物。
     """
+    out_dir = Path(out_dir) if out_dir else _output_dir(SUBDIR_CACHE)
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"oa_download_links_{timestamp}.csv"
@@ -433,12 +450,15 @@ def export_oa_links_csv(
 
 def export_failed_links_csv(
     failed_items: list[dict],
-    out_dir: Path = OUTPUT_DIR,
+    out_dir: Path | None = None,
 ) -> Path:
     """
     导出下载失败的链接清单（CSV），方便人工核查或补下载。
     每行包含 pmid、pmc_id、pdf_url、tgz_url、error 类型。
+
+    默认写入 OUTPUT_DIR/failures（与 LLM 验证失败清单同目录）。
     """
+    out_dir = Path(out_dir) if out_dir else _output_dir(SUBDIR_FAILURE)
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"failed_downloads_{timestamp}.csv"
@@ -461,7 +481,7 @@ def export_failed_links_csv(
 # ── PDF 下载 checkpoint ──────────────────────────────────────
 
 def _pdf_checkpoint_path() -> Path:
-    return Path(OUTPUT_DIR) / PDF_CHECKPOINT_FILENAME
+    return _output_dir(SUBDIR_CACHE) / PDF_CHECKPOINT_FILENAME
 
 
 def _save_pdf_checkpoint(pending: list[dict]) -> None:
@@ -496,11 +516,12 @@ def _clear_pdf_checkpoint():
         logger.info("PDF 检查点已清除（全部重试完成）")
 
 
-def load_failed_items_from_csv(out_dir: Path = OUTPUT_DIR) -> list[dict]:
-    """从最新 failed_downloads_*.csv 加载待重试清单。"""
+def load_failed_items_from_csv(out_dir: Path | None = None) -> list[dict]:
+    """从最新 failed_downloads_*.csv 加载待重试清单（默认找 OUTPUT_DIR/failures）。"""
+    out_dir = Path(out_dir) if out_dir else _output_dir(SUBDIR_FAILURE)
     csv_files = sorted(Path(out_dir).glob("failed_downloads_*.csv"), reverse=True)
     if not csv_files:
-        logger.info("未找到失败下载清单 failed_downloads_*.csv")
+        logger.info(f"未找到失败下载清单 failed_downloads_*.csv（查找目录: {out_dir}）")
         return []
 
     csv_file = csv_files[0]
@@ -952,7 +973,7 @@ def run_pdf_download(db_path: Path = DB_PATH):
 
     # 5. 导出最终失败链接列表
     if failed_items:
-        failed_csv = export_failed_links_csv(failed_items, out_dir=OUTPUT_DIR)
+        failed_csv = export_failed_links_csv(failed_items)
         checkpoint_items = [
             {"pmid": item["pmid"], "pmc_id": item["pmc_id"], "links": item["links"]}
             for item in failed_items

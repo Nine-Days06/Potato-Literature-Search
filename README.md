@@ -8,6 +8,7 @@
 
 - **并发下载** — XML 批次下载自动并发（`ThreadPoolExecutor` + 全局速率限制器），充分发挥 NCBI API 配额
 - **自适应日期切分** — 命中超阈值自动对半递归细分（年→月→日），规避 NCBI `retstart` 10000 硬上限导致的静默截断
+- **检索式实测调优** — 补 18 个野生近缘种、甘薯排除改为「无马铃薯学名证据才排除」，净增 208 篇且零丢失（见[检索式调优](#检索式调优)）
 - **二级过滤** — 硬过滤（规则引擎：标题空/去重排除，摘要空转人工）→ LLM 验证（多 Provider，相关性判定 + 研究方向分类）
 - **断点续传** — XML 批次自动跳过已下载文件；LLM 验证崩溃后可恢复；PDF 下载失败可 `--step pdf-retry` 续跑
 - **多 Provider** — 支持 DeepSeek、智谱 GLM、OpenAI 兼容 API 三种 LLM 后端
@@ -94,6 +95,40 @@ flowchart LR
 
 > **注意**：`--step all`（默认）仅执行 **下载 → 解析 → 清洗**（硬过滤）。
 > LLM 验证、导入复核、PDF 下载为独立步骤，需通过对应 `--step` 参数单独执行。
+
+### 检索式调优
+
+检索式在 `config/settings.py`，由五段拼装：`POTATO_CORE`（栽培马铃薯）、`POTATO_RELATIVES`（18 个野生近缘种）、`SWEET_POTATO`（甘薯干扰项）、`TUBEROSUM_EVIDENCE`（马铃薯学名证据）、`EXCLUSIONS`。
+
+2026-10 做了一轮基于**真实判定**的调优：每个候选改动都先用 `retmax=0` 计数估规模，再把新增文献下载下来用生产提示词实判，统计「新增篇数中真相关占比」——占比低的改动一律否决。
+
+| 候选改动 | 净增篇数 | 实判相关 | 结论 |
+|---|---|---|---|
+| 甘薯排除改为「无马铃薯学名证据才排除」 | +142 | **43（30.3%）** | 采纳 |
+| 补 18 个野生近缘种（`Solanum sect. Petota`） | +66 | **55（77.5%）** | 采纳 |
+| 俗名 `tater/spud/pomme de terre/patata` | +197 | 3（1.5%） | 否决 |
+| `"papa"`（西语马铃薯） | +1054 | 0（0%） | 否决 |
+
+最终效果：**31348 → 31556 篇**，净增 208 篇，**零丢失**（集合用 `fetch_pmid_list` 的日期自适应切分逐条核验，非估算）。
+
+2026-10-18 用新检索式真实重跑全链路（下载 → 解析 → 硬过滤 → LLM 验证）后，净增 208 篇的真实判定：
+
+| 项 | 值 |
+|---|---|
+| 净增 208 篇中入库并可判定 | 199 篇（另 9 篇摘要为空，转人工复核） |
+| 判 `RELEVANT` | **96 篇（48.2%）** |
+| 判 `NOT_RELEVANT` | 103 篇 |
+| 方向分布 | 分子生物学 41 / 遗传育种 14 / 品质营养 11 / 栽培生理 10 / 加工储藏 9 / 植物保护 8 / 综述评论 2 / 其他 1 |
+
+实跑相关率（48.2%）比事先抽样估算（30.3%）高，因为估算样本只覆盖甘薯误伤救回的部分，实跑还含野生近缘种那批高相关文献。
+
+三个容易踩的坑：
+
+1. **`A AND NOT B` 与 `A NOT B` 不等价。** 实测 `(CORE) AND NOT "Solanum tuberosum"[MeSH]` 返回 12136（等于交集数），而 `(CORE) NOT "..."` 返回正确的 22769。检索式里排除子句必须用 `NOT`，不能带 `AND`。
+2. **野生近缘种在 MeSH 里没有独立主题词。** `"Solanum chacoense"[MeSH Terms]` 等全部返回 0，只有 `"Solanum"[MeSH Terms]`（33742）和 `"Solanum tuberosum"[MeSH Terms]`（12136）。所以只能靠 `[Title/Abstract]` 补，不能指望 MeSH。
+3. **甘薯排除的「证据」只能是 `Solanum tuberosum`，不能用 `potato`。** 甘薯论文里的 potato 指的就是甘薯，拿它当证据等于没排除。
+
+`tests/test_settings.py::TestSearchQuery` 锁定上述结构（含括号配对与 `AND NOT` 禁用），防止有人把检索式改回简写。
 
 ### 过滤与分类规则
 
@@ -194,10 +229,13 @@ python main.py --step validate
 #    判 Y/N 后会新建 llm_validation 行，同样进入导出链路
 python main.py --step import-review
 
-# 5.1 导出复核通过文献（同时产出两份 CSV）
-#     articles_raw_*.csv     仅 articles 原生字段
-#     llm_filtered_*.csv     附加 llm_verdict / llm_reason / research_field / human_review
-#     研究方向分类在 llm_filtered_*.csv 里
+# 5.1 导出复核通过文献（同时产出三份 CSV，均落在 data/output/exports/full/）
+#     articles_raw_*.csv            仅 articles 原生字段（15 列）
+#     llm_filtered_*.csv            附加 llm_verdict / llm_reason / research_field / human_review（17 列）
+#     by_field/<方向>/              按 research_field 一方向一目录，目录内两份：
+#                                     llm_filtered_by_field_<方向>_*.csv  同 llm_filtered（17 列）
+#                                     articles_raw_by_field_<方向>_*.csv  同 articles_raw（15 列，无 LLM 信息）
+#     另附 llm_filtered_by_field_index_*.csv 记录各方向篇数、目录与两份文件名
 python main.py --step export
 
 # 批量验证（智谱专用，异步处理大文献集）
@@ -236,7 +274,7 @@ python main.py --step validate --batch
 # 导入人工复核 CSV（自动查找最新复核文件）
 python main.py --step import-review
 # 指定复核文件
-python main.py --step import-review --csv data/output/llm_review_pending_20250101_120000.csv
+python main.py --step import-review --csv data/output/review/llm_review_pending_20250101_120000.csv
 
 # 导出复核通过文献（articles_raw_*.csv 原始字段 + llm_filtered_*.csv 含研究方向分类）
 python main.py --step export
@@ -279,18 +317,32 @@ python main.py --query "potato AND drought AND gene"
 
 ## 输出文件
 
+`data/output/` 按用途分成 5 个子目录，全量与增量分开存放：
+
+| 子目录 | 存放内容 |
+|--------|----------|
+| `exports/full/` | 全量交付 CSV（`articles_raw_*` / `llm_filtered_*` / `by_field/` 按方向拆分及其索引） |
+| `exports/incremental/` | 增量交付 CSV（文件名带 `_incremental_since_*`） |
+| `review/` | 待人工复核清单（`llm_review_pending_*`） |
+| `failures/` | 失败清单（`llm_validation_failed_*` / `failed_downloads_*`） |
+| `cache/` | 检查点与中间件（`*_progress.json` / `batch_*` / `oa_download_links_*`），可随时删 |
+
 | 文件 | 说明 |
 |------|------|
 | `data/processed/potato_lit.db` | 全量结构化文献库（articles + filter_log + llm_validation 三张表） |
-| `data/output/llm_review_pending_*.csv` | 待人工复核清单（10 列，含 `pub_year` / `journal` / `article_types` 便于无摘要文献判断；`llm_verdict='NEEDS_REVIEW'` 的行是摘要为空转人工的文献），标注 Y/N 后用 `--step import-review` 导回 |
-| `data/output/llm_validation_failed_*.csv` | LLM 校验失败 PMID 清单 |
-| `data/output/llm_filtered_*.csv` | **交付主文件**：LLM + 人工复核后的最终结果，含 `llm_verdict` / `llm_reason` / `research_field` / `human_review` 四列 |
-| `data/output/articles_raw_*.csv` | 复核通过文献的原始信息（不含 raw_xml_file、LLM/复核列），供下游流程使用 |
-| `data/output/llm_filtered_incremental_*.csv` | **增量导出**：指定时间后新增的复核通过文献，带 `research_field` 研究方向列 |
-| `data/output/articles_raw_incremental_*.csv` | **增量导出**：指定时间后新增的复核通过文献原始信息 |
-| `data/output/failed_downloads_*.csv` | PDF 下载失败链接清单（供 `--step pdf-retry` 续跑） |
-| `data/output/pdf_download_progress.json` | PDF 重试断点（中断后自动恢复） |
-| `data/output/oa_download_links_*.csv` | OA 资源下载链接清单 |
+| `data/output/review/llm_review_pending_*.csv` | 待人工复核清单（10 列，含 `pub_year` / `journal` / `article_types` 便于无摘要文献判断；`llm_verdict='NEEDS_REVIEW'` 的行是摘要为空转人工的文献），标注 Y/N 后用 `--step import-review` 导回 |
+| `data/output/failures/llm_validation_failed_*.csv` | LLM 校验失败 PMID 清单 |
+| `data/output/exports/full/llm_filtered_*.csv` | **交付主文件**：LLM + 人工复核后的最终结果，含 `llm_verdict` / `llm_reason` / `research_field` / `human_review` 四列 |
+| `data/output/exports/full/llm_filtered_by_field_index_*.csv` | 研究方向索引（`research_field` / `count` / `dir` / `llm_file` / `raw_file` 五列），记录每个方向的篇数、子目录名与两份文件名 |
+| `data/output/exports/full/by_field/<方向>/llm_filtered_by_field_<方向>_*.csv` | **按研究方向拆分的交付文件（含 LLM 信息）**：一方向一目录，列结构与 `llm_filtered_*.csv` 完全一致（17 列） |
+| `data/output/exports/full/by_field/<方向>/articles_raw_by_field_<方向>_*.csv` | **按研究方向拆分的交付文件（纯原始信息）**：列结构与 `articles_raw_*.csv` 完全一致（15 列），**不含任何 LLM / 复核信息**，供只需要原始元数据的下游流程直接使用 |
+| `data/output/exports/full/articles_raw_*.csv` | 复核通过文献的原始信息（不含 raw_xml_file、LLM/复核列），供下游流程使用 |
+| `data/output/exports/incremental/llm_filtered_incremental_*.csv` | **增量导出**：指定时间后新增的复核通过文献，带 `research_field` 研究方向列 |
+| `data/output/exports/incremental/by_field/<方向>/` | **增量 + 按方向拆分**：同上按时段过滤后再分方向，目录内同样两份（`llm_filtered_incremental_since_*_by_field_<方向>_*.csv` + `articles_raw_incremental_since_*_by_field_<方向>_*.csv`） |
+| `data/output/exports/incremental/articles_raw_incremental_*.csv` | **增量导出**：指定时间后新增的复核通过文献原始信息 |
+| `data/output/failures/failed_downloads_*.csv` | PDF 下载失败链接清单（供 `--step pdf-retry` 续跑） |
+| `data/output/cache/pdf_download_progress.json` | PDF 重试断点（中断后自动恢复） |
+| `data/output/cache/oa_download_links_*.csv` | OA 资源下载链接清单（仅用于缓存复用，不是交付件） |
 | `data/pdfs/` | LLM 判定相关文献的 PDF 全文文件（无 PDF 时回退保存 `.txt` 文本全文） |
 | `logs/` | 各模块运行日志（按名称+日期分文件） |
 

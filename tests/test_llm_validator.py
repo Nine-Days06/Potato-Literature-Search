@@ -18,8 +18,11 @@ from cleaner.llm_validator import (
     _export_filtered_csv,
     export_incremental_raw_csv,
     export_incremental_filtered_csv,
+    export_by_research_field,
+    _field_slug,
     RAW_EXPORT_FIELDS,
     FILTERED_EXPORT_FIELDS,
+    FIELD_EXPORT_INDEX_FIELDS,
     REVIEW_PENDING_FIELDS,
     NEEDS_REVIEW_VERDICT,
 )
@@ -855,6 +858,193 @@ class TestIncrementalFilteredCsv(unittest.TestCase):
     def test_no_rows_returns_none(self):
         self._seed()
         self.assertIsNone(self._export("2027-01-01T00:00:00"))
+
+
+class TestExportByResearchField(unittest.TestCase):
+    """export_by_research_field：一方向一文件 + 索引，与 filtered 同谓词同列"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = Path(self.temp_dir) / "test.db"
+        init_db(self.db_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _seed(self):
+        with get_conn(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO articles "
+                "(pmid, title, abstract, pub_year, journal, raw_xml_file) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("1", "T1", "A1", "2026", "Plant J", "b.xml"),
+                    ("2", "T2", "A2", "2026", "Plant J", "b.xml"),
+                    ("3", "T3", "A3", "2026", "Plant J", "b.xml"),
+                    ("4", "T4", "A4", "2026", "Plant J", "b.xml"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO llm_validation "
+                "(pmid, llm_verdict, reason, validated_at, research_field, "
+                "human_review) VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ("1", "RELEVANT", "r1", "2026-01-01T00:00:00", "植物保护", None),
+                    ("2", "RELEVANT", "r2", "2026-01-02T00:00:00", "植物保护", None),
+                    ("3", "RELEVANT", "r3", "2026-01-03T00:00:00", "遗传育种", None),
+                    # 被复核谓词排除，不应出现在任何方向文件里
+                    ("4", "NOT_RELEVANT", "r4", "2026-01-04T00:00:00", "", None),
+                ],
+            )
+
+    def _export(self, **kw):
+        import cleaner.llm_validator as mod
+        orig = mod.OUTPUT_DIR
+        mod.OUTPUT_DIR = self.temp_dir
+        try:
+            return mod.export_by_research_field(db_path=self.db_path, **kw)
+        finally:
+            mod.OUTPUT_DIR = orig
+
+    def _read(self, path):
+        with open(path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            return reader.fieldnames, list(reader)
+
+    def _full_dir(self):
+        """全量导出的落地目录（OUTPUT_DIR/exports/full）
+
+        索引在导出根目录，方向文件在 by_field/<方向>/ 子目录里，
+        测试不能只扫 temp_dir 根目录。
+        """
+        return Path(self.temp_dir) / "exports" / "full"
+
+    def _field_dir(self, field):
+        return self._full_dir() / "by_field" / field
+
+    def test_one_dir_per_field_with_two_files(self):
+        """每个方向一个目录，目录内含「含 LLM 信息」与「raw 格式」两份"""
+        self._seed()
+        paths = self._export()
+        self.assertEqual(len(paths), 4)  # 2 个方向 × 2 份
+        for field, expected in (("植物保护", 2), ("遗传育种", 1)):
+            fdir = self._field_dir(field)
+            self.assertTrue(fdir.is_dir(), fdir)
+            llm_files = sorted(fdir.glob("llm_filtered_by_field_*.csv"))
+            raw_files = sorted(fdir.glob("articles_raw_by_field_*.csv"))
+            self.assertEqual(len(llm_files), 1, fdir)
+            self.assertEqual(len(raw_files), 1, fdir)
+            fieldnames, rows = self._read(llm_files[0])
+            self.assertEqual(fieldnames, FILTERED_EXPORT_FIELDS)
+            self.assertEqual(len(rows), expected)
+            raw_fieldnames, raw_rows = self._read(raw_files[0])
+            self.assertEqual(raw_fieldnames, RAW_EXPORT_FIELDS)
+            self.assertEqual(len(raw_rows), expected)
+            self.assertEqual({r["pmid"] for r in raw_rows},
+                             {r["pmid"] for r in rows})
+
+    def test_raw_variant_has_no_llm_columns(self):
+        """raw 版必须与 articles_raw_*.csv 同列，不含任何 LLM/复核信息"""
+        self._seed()
+        self._export()
+        raw_files = sorted(self._full_dir().glob("by_field/*/articles_raw_by_field_*.csv"))
+        self.assertTrue(raw_files)
+        for p in raw_files:
+            fieldnames, _ = self._read(p)
+            self.assertEqual(fieldnames, RAW_EXPORT_FIELDS)
+            for col in ("llm_verdict", "llm_reason", "research_field",
+                        "human_review", "reason"):
+                self.assertNotIn(col, fieldnames, p.name)
+
+    def test_not_relevant_never_exported(self):
+        self._seed()
+        paths = self._export()
+        pmids = set()
+        for p in paths:
+            if not p.name.startswith("llm_filtered"):
+                continue
+            _, rows = self._read(p)
+            pmids |= {r["pmid"] for r in rows}
+        self.assertEqual(pmids, {"1", "2", "3"})
+
+    def test_index_lists_every_field_with_counts(self):
+        self._seed()
+        self._export()
+        index_files = sorted(self._full_dir().glob(
+            "llm_filtered_by_field_index_*.csv"))
+        self.assertEqual(len(index_files), 1)
+        fieldnames, rows = self._read(index_files[0])
+        self.assertEqual(fieldnames, FIELD_EXPORT_INDEX_FIELDS)
+        by_field = {r["research_field"]: int(r["count"]) for r in rows}
+        self.assertEqual(by_field, {"植物保护": 2, "遗传育种": 1})
+        self.assertEqual(sum(by_field.values()), 3)
+        # 索引里的目录与两份文件名都必须真实存在
+        for r in rows:
+            self.assertTrue((self._full_dir() / r["dir"]).is_dir(), r["dir"])
+            for key in ("llm_file", "raw_file"):
+                self.assertTrue(
+                    (self._full_dir() / r["dir"] / r[key]).exists(), r[key])
+
+    def test_fields_follow_research_fields_declaration_order(self):
+        """方向顺序取 RESEARCH_FIELDS 声明顺序，而非字典插入顺序"""
+        self._seed()
+        self._export()
+        index = sorted(self._full_dir().glob(
+            "llm_filtered_by_field_index_*.csv"))[0]
+        _, rows = self._read(index)
+        order = [r["research_field"] for r in rows]
+        self.assertEqual(order, ["遗传育种", "植物保护"])
+
+    def test_missing_field_falls_back_to_default(self):
+        """历史脏数据 direction 为空 → 归入兜底方向，不静默丢弃"""
+        self._seed()
+        with get_conn(self.db_path) as conn:
+            conn.execute("UPDATE llm_validation SET research_field='' "
+                         "WHERE pmid='3'")
+        paths = self._export()
+        llm_paths = [p for p in paths if p.name.startswith("llm_filtered")]
+        _, rows = self._read([p for p in llm_paths
+                              if DEFAULT_RESEARCH_FIELD in p.name][0])
+        self.assertEqual([r["pmid"] for r in rows], ["3"])
+
+    def test_incremental_prefix_and_since_filter(self):
+        self._seed()
+        # 谓词是严格大于（> since），故用 01-01 12:00 把 pmid 2 圈进来
+        paths = self._export(since_timestamp="2026-01-01T12:00:00")
+        self.assertTrue(paths)
+        for p in paths:
+            expected = ("llm_filtered_incremental_since_"
+                        if p.name.startswith("llm_filtered")
+                        else "articles_raw_incremental_since_")
+            self.assertTrue(p.name.startswith(expected), p.name)
+        pmids = set()
+        for p in paths:
+            if not p.name.startswith("llm_filtered"):
+                continue
+            _, rows = self._read(p)
+            pmids |= {r["pmid"] for r in rows}
+        self.assertEqual(pmids, {"2", "3"})
+
+    def test_no_rows_returns_empty_list(self):
+        with get_conn(self.db_path) as conn:
+            conn.execute("INSERT INTO articles (pmid, title, abstract) "
+                         "VALUES ('9', 'T', 'A')")
+        self.assertEqual(self._export(), [])
+
+
+class TestFieldSlug(unittest.TestCase):
+    """方向标签转文件名：中文原样保留，只清理路径分隔符"""
+
+    def test_chinese_label_kept(self):
+        self.assertEqual(_field_slug("植物保护"), "植物保护")
+
+    def test_path_separators_replaced(self):
+        self.assertEqual(_field_slug("a/b\\c"), "a_b_c")
+
+    def test_blank_falls_back_to_default(self):
+        self.assertEqual(_field_slug(""), DEFAULT_RESEARCH_FIELD)
+        self.assertEqual(_field_slug("   "), DEFAULT_RESEARCH_FIELD)
 
 
 class TestReviewPendingCsv(unittest.TestCase):

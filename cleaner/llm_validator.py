@@ -17,6 +17,8 @@ from openai import OpenAI
 
 from config.settings import (
     DB_PATH, OUTPUT_DIR, LOG_DIR,
+    SUBDIR_EXPORT_FULL, SUBDIR_EXPORT_INCREMENTAL, SUBDIR_REVIEW,
+    SUBDIR_FAILURE, SUBDIR_CACHE,
     LLM_BATCH_SIZE, LLM_CONCURRENCY, LLM_MAX_TOKENS, LLM_MAX_RETRIES, LLM_MAX_ROUNDS,
     LLM_PROVIDER, LLM_PROVIDER_CONFIGS,
     LLM_BATCH_POLL_INTERVAL, LLM_BATCH_TIMEOUT, LLM_BATCH_AUTO_DELETE,
@@ -32,8 +34,18 @@ logger = get_logger("llm_validator", log_dir=LOG_DIR)
 CHECKPOINT_FILENAME = "llm_validation_progress.json"
 
 
+def _output_dir(subdir: str) -> Path:
+    """按**调用时**的模块级 OUTPUT_DIR 派生子目录。
+
+    不能写成 `OUTPUT_DIR / subdir` 的模块级常量：测试靠 patch
+    模块属性 `OUTPUT_DIR` 重定向输出，常量在 import 期就固化了。
+    """
+    return Path(OUTPUT_DIR) / subdir
+
+
 def _checkpoint_path() -> Path:
-    return Path(OUTPUT_DIR) / CHECKPOINT_FILENAME
+    return _output_dir(SUBDIR_CACHE) / CHECKPOINT_FILENAME
+
 
 
 def _save_checkpoint(round_num: int, failed_rows: list):
@@ -674,7 +686,7 @@ def _export_failed_pmids_csv(failed_rows: list) -> Path | None:
     """导出最终验证失败的 PMID 列表"""
     if not failed_rows:
         return None
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = _output_dir(SUBDIR_FAILURE)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"llm_validation_failed_{ts}.csv"
@@ -755,7 +767,7 @@ def _export_review_csv(db_path: Path | None = None) -> Path | None:
         logger.info("没有待复核的记录")
         return None
 
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = _output_dir(SUBDIR_REVIEW)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"llm_review_pending_{ts}.csv"
@@ -802,7 +814,7 @@ PROMPT_OUTPUT_FORMAT = (
 
 
 def _batch_checkpoint_path() -> Path:
-    return Path(OUTPUT_DIR) / BATCH_CHECKPOINT_FILE
+    return _output_dir(SUBDIR_CACHE) / BATCH_CHECKPOINT_FILE
 
 
 def _save_batch_checkpoint(data: dict):
@@ -844,7 +856,7 @@ def _build_per_article_prompt(pmid: str, title: str, abstract: str) -> str:
 
 def _build_jsonl(rows: list) -> Path:
     """构建 batch JSONL 文件（每篇一行），返回文件路径"""
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = _output_dir(SUBDIR_CACHE)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     jsonl_path = out_dir / f"batch_input_{ts}.jsonl"
@@ -1161,7 +1173,7 @@ def _download_and_parse_batch(client, batch_status, chk: dict):
         logger.info("下载结果文件...")
         try:
             content = client.files.content(output_id)
-            tmp_path = Path(OUTPUT_DIR) / f"batch_output_{chk['batch_id']}.jsonl"
+            tmp_path = _output_dir(SUBDIR_CACHE) / f"batch_output_{chk['batch_id']}.jsonl"
             tmp_path.parent.mkdir(parents=True, exist_ok=True)
             content.write_to_file(str(tmp_path))
 
@@ -1177,7 +1189,7 @@ def _download_and_parse_batch(client, batch_status, chk: dict):
         logger.info("下载错误文件...")
         try:
             error_content = client.files.content(error_id)
-            error_path = Path(OUTPUT_DIR) / f"batch_errors_{chk['batch_id']}.jsonl"
+            error_path = _output_dir(SUBDIR_CACHE) / f"batch_errors_{chk['batch_id']}.jsonl"
             error_path.parent.mkdir(parents=True, exist_ok=True)
             error_content.write_to_file(str(error_path))
 
@@ -1235,13 +1247,13 @@ def import_human_review(csv_path: str | None = None):
       人工结论是这篇文献唯一的判定，必须 INSERT 一行，否则
       `_REVIEW_PASS_PREDICATE` 永远匹配不到它，判 Y 也导不出去。
     """
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = _output_dir(SUBDIR_REVIEW)
     if csv_path:
         review_file = Path(csv_path)
     else:
         candidates = sorted(out_dir.glob("llm_review_pending_*.csv"), reverse=True)
         if not candidates:
-            logger.error("未找到 llm_review_pending_*.csv 文件")
+            logger.error(f"未找到 llm_review_pending_*.csv 文件（查找目录: {out_dir}）")
             return
         review_file = candidates[0]
 
@@ -1370,7 +1382,8 @@ def _export_filtered_csv(db_path: Path | None = None,
         logger.info("没有符合条件的最终结果")
         return None
 
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = _output_dir(
+        SUBDIR_EXPORT_INCREMENTAL if since_timestamp else SUBDIR_EXPORT_FULL)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if since_timestamp:
@@ -1384,6 +1397,139 @@ def _export_filtered_csv(db_path: Path | None = None,
 
     logger.info(f"最终过滤结果: {csv_path} ({len(rows)} 篇)")
     return csv_path
+
+
+FIELD_EXPORT_INDEX_SUFFIX = "by_field_index"
+FIELD_EXPORT_INDEX_FIELDS = ["research_field", "count", "dir", "llm_file", "raw_file"]
+# 每个研究方向一个子目录（相对导出根目录），目录里放两份：带 LLM 信息的、
+# 以及与 articles_raw_*.csv 同列结构的纯原始信息。
+SUBDIR_FIELD_EXPORT = "by_field"
+
+
+def _field_slug(field: str) -> str:
+    """研究方向 → 安全文件名片段（中文标签原样保留，只清理路径分隔符等）"""
+    slug = re.sub(r'[\\/:*?"<>|\s]+', "_", (field or "").strip())
+    return slug or DEFAULT_RESEARCH_FIELD
+
+
+def _query_raw_by_field_export(db_path: Path | None = None,
+                               since_timestamp: str | None = None) -> list:
+    """按方向的 raw 导出查询：RAW_EXPORT_FIELDS + research_field（仅用于分桶）。
+
+    与 _query_raw_export 列结构一致（额外只多一个 research_field），
+    保证 articles_raw_by_field_*.csv 与 articles_raw_*.csv 完全对齐。
+    """
+    target_db = db_path or DB_PATH
+    sql = f"""
+            SELECT a.pmid, a.title, a.abstract, a.keywords, a.mesh_terms,
+                   a.pub_year, a.pub_month, a.journal, a.journal_abbr, a.doi,
+                   a.pmc_id, a.article_types, a.authors, a.affiliation,
+                   a.language, v.research_field
+            FROM articles a
+            JOIN llm_validation v ON a.pmid = v.pmid
+            WHERE {_REVIEW_PASS_PREDICATE}
+        """
+    params: list = []
+    if since_timestamp:
+        sql += "\n              AND v.validated_at > ?"
+        params.append(since_timestamp)
+    with get_conn(target_db) as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def _bucket_by_field(rows, field_key: str = "research_field") -> dict:
+    """把行按 research_field 分桶（空方向回落 DEFAULT_RESEARCH_FIELD，不丢弃）"""
+    buckets: dict = {}
+    for row in rows:
+        # 理论上 RELEVANT 必有方向（_normalize_research_field 已兜底），
+        # 这里再兜一次，避免历史脏数据在导出时静默丢失。
+        field = (row[field_key] or "").strip() or DEFAULT_RESEARCH_FIELD
+        buckets.setdefault(field, []).append(row)
+    return buckets
+
+
+def export_by_research_field(db_path: Path | None = None,
+                             since_timestamp: str | None = None) -> list:
+    """按研究方向把复核通过的文献拆成独立目录，每个方向一个文件夹、两份 CSV。
+
+    每个方向目录（`by_field/<方向>/`）里放：
+      - `llm_filtered_by_field_<方向>_<ts>.csv`：FILTERED_EXPORT_FIELDS 17 列，
+        带 llm_verdict / llm_reason / research_field / human_review
+      - `articles_raw_by_field_<方向>_<ts>.csv`：RAW_EXPORT_FIELDS 15 列，
+        与 articles_raw_*.csv 完全同构，不含任何 LLM/复核信息，
+        供只需要原始元数据的下游流程直接用
+
+    两份用同一复核谓词（_REVIEW_PASS_PREDICATE）与同一 since 过滤，行集一致。
+    方向取 RESEARCH_FIELDS 声明顺序，没有文献的方向不产目录。
+    索引文件（llm_filtered_by_field_index_*.csv）记录每个方向的篇数、
+    子目录名与两份文件名。
+
+    since_timestamp 供增量路径复用（文件名带 incremental 前缀）。
+    db_path 默认 None 走模块级 DB_PATH（同 _query_filtered_export 的理由）。
+    """
+    filtered_rows = _query_filtered_export(db_path, since_timestamp)
+    if not filtered_rows:
+        logger.info("没有符合条件的最终结果，按研究方向导出跳过")
+        return []
+
+    raw_rows = _query_raw_by_field_export(db_path, since_timestamp)
+
+    filtered_buckets = _bucket_by_field(filtered_rows)
+    raw_buckets = _bucket_by_field(raw_rows)
+
+    ordered = [f for f in RESEARCH_FIELDS if filtered_buckets.get(f)]
+    ordered += sorted(f for f in filtered_buckets
+                      if f not in RESEARCH_FIELDS and filtered_buckets[f])
+
+    base_dir = _output_dir(
+        SUBDIR_EXPORT_INCREMENTAL if since_timestamp else SUBDIR_EXPORT_FULL)
+    base_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = "llm_filtered"
+    raw_prefix = "articles_raw"
+    if since_timestamp:
+        suffix = f"_since_{since_timestamp.replace(':', '-').replace('T', '_')}"
+        prefix = f"llm_filtered_incremental{suffix}"
+        raw_prefix = f"articles_raw_incremental{suffix}"
+
+    written = []
+    index_rows = []
+    for field in ordered:
+        bucket = filtered_buckets[field]
+        slug = _field_slug(field)
+        field_dir = base_dir / SUBDIR_FIELD_EXPORT / slug
+        field_dir.mkdir(parents=True, exist_ok=True)
+
+        llm_path = field_dir / f"{prefix}_by_field_{slug}_{ts}.csv"
+        _write_dict_csv(llm_path, FILTERED_EXPORT_FIELDS, bucket,
+                        transform=_rename_reason_to_llm_reason)
+        written.append(llm_path)
+
+        # raw 版：只投影 RAW_EXPORT_FIELDS，把分桶用的 research_field 丢掉，
+        # 保证列结构与 articles_raw_*.csv 逐列一致。
+        raw_bucket = raw_buckets.get(field, [])
+        raw_path = field_dir / f"{raw_prefix}_by_field_{slug}_{ts}.csv"
+        _write_dict_csv(raw_path, RAW_EXPORT_FIELDS,
+                        ({k: row[k] for k in RAW_EXPORT_FIELDS}
+                         for row in raw_bucket))
+        written.append(raw_path)
+
+        index_rows.append({
+            "research_field": field,
+            "count": len(bucket),
+            "dir": f"{SUBDIR_FIELD_EXPORT}/{slug}",
+            "llm_file": llm_path.name,
+            "raw_file": raw_path.name,
+        })
+        logger.info(f"  按研究方向导出 {field}: {len(bucket)} 篇 "
+                    f"→ {SUBDIR_FIELD_EXPORT}/{slug}/（含 LLM 信息 + raw 格式两份）")
+
+    index_path = base_dir / f"{prefix}_{FIELD_EXPORT_INDEX_SUFFIX}_{ts}.csv"
+    _write_dict_csv(index_path, FIELD_EXPORT_INDEX_FIELDS, index_rows)
+    logger.info(f"研究方向索引: {index_path} ({len(index_rows)} 个方向, "
+                f"共 {len(filtered_rows)} 篇)")
+
+    return written
 
 
 RAW_EXPORT_FIELDS = [
@@ -1449,7 +1595,7 @@ def _export_raw_csv(db_path: Path = DB_PATH) -> Path | None:
         logger.info("没有符合条件的原始文献记录")
         return None
 
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = _output_dir(SUBDIR_EXPORT_FULL)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = out_dir / f"articles_raw_{ts}.csv"
@@ -1500,7 +1646,7 @@ def export_incremental_raw_csv(since_timestamp: str = None, db_path: Path = DB_P
                 f"本次并非真正的增量导出。请改用晚于上次验证时间的时间戳。"
             )
 
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = _output_dir(SUBDIR_EXPORT_INCREMENTAL)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = f"_since_{since_timestamp.replace(':', '-').replace('T', '_')}" if since_timestamp else ""
@@ -1534,7 +1680,7 @@ def export_incremental_filtered_csv(since_timestamp: str = None,
                 f"时间戳 {since_timestamp} 早于全部文献的验证时间，本次并非真正的增量导出。"
             )
 
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = _output_dir(SUBDIR_EXPORT_INCREMENTAL)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     suffix = f"_since_{since_timestamp.replace(':', '-').replace('T', '_')}" if since_timestamp else ""
