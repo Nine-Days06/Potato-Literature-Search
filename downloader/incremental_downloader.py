@@ -120,9 +120,9 @@ def run_incremental_download(
         _save_pmid_list(pmid_file, merged_pmids, query)
         return []
     
-    # 5. 仅下载新增 PMID 的 XML
+    # 5. 仅下载新增 PMID 的 XML（把 query 写进 pmid_list.json，保证来源可追溯）
     logger.info(f"开始下载 {len(added_pmids)} 篇新文献的 XML...")
-    xml_files = download_xml_batches(list(added_pmids))
+    xml_files = download_xml_batches(list(added_pmids), query=query)
     
     # 6. 合并保存 PMID 列表（全量覆盖，包含旧+新）
     merged_pmids = sorted(old_pmids | new_pmids_set)

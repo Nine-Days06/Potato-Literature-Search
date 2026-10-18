@@ -13,7 +13,7 @@ import time
 import json
 import threading
 import requests
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -290,12 +290,18 @@ def _download_single_batch(
     out_dir: Path,
     batch_size: int,
     total_batches: int,
+    seq: int | None = None,
 ) -> Path | None:
-    """下载单个批次，由线程池调用，受全局速率限制器控制"""
+    """下载单个批次，由线程池调用，受全局速率限制器控制。
+
+    batch_idx 决定文件名（增量续写时可能不从 0 开始），
+    seq 仅用于进度日志的「第几批 / 共几批」，省略时等于 batch_idx。
+    """
+    seq = batch_idx if seq is None else seq
     batch_file = out_dir / f"batch_{batch_idx:05d}.xml"
 
     if batch_file.exists() and batch_file.stat().st_size > 0:
-        logger.info(f"  [批次 {batch_idx+1}/{total_batches}] 已存在，跳过")
+        logger.info(f"  [批次 {seq+1}/{total_batches}] 已存在，跳过")
         return batch_file
 
     params = {
@@ -312,37 +318,97 @@ def _download_single_batch(
         with open(batch_file, "wb") as f:
             f.write(r.content)
         logger.info(
-            f"  [批次 {batch_idx+1}/{total_batches}] "
+            f"  [批次 {seq+1}/{total_batches}] "
             f"下载 {len(chunk)} 篇 → {batch_file.name} "
             f"({batch_file.stat().st_size / 1024:.1f} KB)"
         )
         return batch_file
     except Exception as e:
-        logger.error(f"  [批次 {batch_idx+1}] 下载失败: {e}")
+        logger.error(f"  [批次 {seq+1}] 下载失败: {e}")
         return None
+
+
+def _archive_stale_batches(out_dir: Path, current_query: str) -> None:
+    """检索词变化时，把旧批次文件移入 `_archive_<时间戳>/` 子目录。
+
+    断点续传只判断 `batch_NNNNN.xml` 是否存在，不看内容来自哪条检索式。
+    检索词一改，同名批次装的就是另一批 PMID，直接跳过会让新旧数据静默混在一起
+    （实测：换检索式后重下，105 个旧批次全被跳过，实际一篇都没更新）。
+    归档而不是删除——旧 XML 可能还要复查；解析器只 glob 当前目录，不会读到子目录。
+    """
+    pmid_list_path = out_dir / "pmid_list.json"
+    if not pmid_list_path.exists():
+        return
+    try:
+        with open(pmid_list_path, encoding="utf-8") as f:
+            old_query = json.load(f).get("query") or ""
+    except (OSError, ValueError) as e:
+        logger.warning(f"读取旧 pmid_list.json 失败，无法判断检索词是否变化: {e}")
+        return
+
+    if old_query == current_query:
+        return
+
+    stale = sorted(out_dir.glob("batch_*.xml"))
+    if not stale:
+        return
+
+    dest = out_dir / f"_archive_{datetime.now():%Y%m%d_%H%M%S}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for path in stale:
+        path.replace(dest / path.name)
+    logger.warning(
+        f"检索词已变化，{len(stale)} 个旧批次文件已归档至 {dest.name}/（不参与解析）"
+    )
+
+
+def _next_batch_index(out_dir: Path) -> int:
+    """已有批次文件的最大编号 +1。
+
+    增量下载只传新增 PMID，若编号仍从 0 开始，`batch_00000.xml` 等旧文件会被
+    断点续传判定为「已存在」直接跳过——新增文献静默丢失。编号必须接续。
+    """
+    max_idx = -1
+    for path in out_dir.glob("batch_*.xml"):
+        m = re.fullmatch(r"batch_(\d+)\.xml", path.name)
+        if m:
+            max_idx = max(max_idx, int(m.group(1)))
+    return max_idx + 1
 
 
 def download_xml_batches(
     pmids: list[str],
     out_dir: Path = RAW_XML_DIR,
     batch_size: int = EFETCH_BATCH_SIZE,
+    query: str | None = None,
 ) -> list[Path]:
     """
     将 PMID 列表分批，通过 efetch 并发下载 PubmedArticleSet XML。
     已存在的批次文件自动跳过（断点续传）。
     返回所有成功下载的批次文件路径。
+
+    query 只用于写入 pmid_list.json 的来源记录；省略则记 PUBMED_QUERY。
+    自定义 --query 时必须传入，否则记录的来源与实际检索不符，
+    后续增量对比会误判「移除/新增」。
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    resolved_query = query or PUBMED_QUERY
+
+    _archive_stale_batches(out_dir, resolved_query)
 
     # 保存 PMID 列表备用（便于后续复查）
     pmid_list_path = out_dir / "pmid_list.json"
     with open(pmid_list_path, "w") as f:
-        json.dump({"query": PUBMED_QUERY, "total": len(pmids), "pmids": pmids}, f)
+        json.dump({"query": resolved_query, "total": len(pmids),
+                   "pmids": pmids}, f)
     logger.info(f"PMID 列表已保存至 {pmid_list_path}")
 
     total_batches = (len(pmids) + batch_size - 1) // batch_size
     max_workers = 3 if not NCBI_API_KEY else 8
+    first_index = _next_batch_index(out_dir)
+    if first_index:
+        logger.info(f"续写批次文件，从 batch_{first_index:05d}.xml 开始编号")
 
     chunks = [
         pmids[i * batch_size : (i + 1) * batch_size]
@@ -352,12 +418,12 @@ def download_xml_batches(
     xml_files = []
     futures = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for batch_idx, chunk in enumerate(chunks):
+        for offset, chunk in enumerate(chunks):
             future = executor.submit(
-                _download_single_batch, batch_idx, chunk,
-                out_dir, batch_size, total_batches
+                _download_single_batch, first_index + offset, chunk,
+                out_dir, batch_size, total_batches, offset
             )
-            futures[future] = batch_idx
+            futures[future] = offset
 
         for future in as_completed(futures):
             result = future.result()
@@ -381,5 +447,5 @@ def run_download(query: str = PUBMED_QUERY) -> list[Path]:
     all_pmids = fetch_pmid_list(query)
     logger.info(f"共 {len(all_pmids)} 篇待下载")
 
-    xml_files = download_xml_batches(all_pmids)
+    xml_files = download_xml_batches(all_pmids, query=query)
     return xml_files

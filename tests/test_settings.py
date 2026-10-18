@@ -123,5 +123,64 @@ class TestProviderConfigShape(unittest.TestCase):
             self.assertIn(cfg["client_type"], ("openai", "zhipuai"), name)
 
 
+class TestSearchQuery(unittest.TestCase):
+    """检索式结构锁定。
+
+    2026-10 检索式调优（实测见 README「检索式调优」）：
+      - 补 18 个野生近缘种（MeSH 无独立主题词，只能靠 TIAB）
+      - 甘薯排除改为「命中且无马铃薯学名证据才排除」，救回 142 篇两者同研文献
+    这些断言防的是「有人好心把检索式改回简写」。
+    """
+
+    def test_core_covers_cultivated_potato(self):
+        for clause in ('potato[Title/Abstract]',
+                       '"Solanum tuberosum"[Title/Abstract]',
+                       '"Solanum tuberosum"[MeSH Terms]',
+                       '"Solanum sect. Petota"[MeSH Terms]'):
+            self.assertIn(clause, settings.POTATO_CORE, clause)
+
+    def test_wild_species_are_unique_and_tiab_scoped(self):
+        names = settings.WILD_SPECIES
+        self.assertEqual(len(names), len(set(names)), "野生种列表有重复")
+        self.assertGreaterEqual(len(names), 18)
+        for name in names:
+            self.assertIn('"%s"[Title/Abstract]' % name,
+                          settings.POTATO_RELATIVES, name)
+
+    def test_wild_species_do_not_repeat_potato_keyword(self):
+        """野生种子句若含 potato 就与 CORE 重叠，纯属浪费查询预算"""
+        self.assertNotIn("potato", settings.POTATO_RELATIVES.lower())
+
+    def test_sweet_potato_covers_both_aliases(self):
+        self.assertIn('"sweet potato"[Title/Abstract]', settings.SWEET_POTATO)
+        self.assertIn('"Ipomoea batatas"[Title/Abstract]', settings.SWEET_POTATO)
+
+    def test_tuberosum_evidence_excludes_bare_potato(self):
+        """甘薯论文里的 potato 指的就是甘薯，拿它当证据等于没排除"""
+        evidence = settings.TUBEROSUM_EVIDENCE
+        self.assertIn('"Solanum tuberosum"[Title/Abstract]', evidence)
+        self.assertIn('"Solanum tuberosum"[MeSH Terms]', evidence)
+        self.assertNotIn("potato[", evidence.lower())
+
+    def test_exclusions_use_not_not_instead_of_and_not(self):
+        """实测 PubMed 的 `A AND NOT B` 会退化成交集语义，返回完全错误的结果"""
+        self.assertEqual(
+            settings.EXCLUSIONS,
+            "NOT (%s NOT %s)" % (settings.SWEET_POTATO,
+                                 settings.TUBEROSUM_EVIDENCE))
+        self.assertNotIn("AND NOT", settings.PUBMED_QUERY.upper())
+
+    def test_pubmed_query_includes_core_and_relatives(self):
+        self.assertIn(settings.POTATO_CORE, settings.PUBMED_QUERY)
+        self.assertIn(settings.POTATO_RELATIVES, settings.PUBMED_QUERY)
+        self.assertTrue(settings.PUBMED_QUERY.startswith("(("))
+        self.assertTrue(settings.PUBMED_QUERY.endswith(settings.EXCLUSIONS))
+
+    def test_query_syntax_is_balanced(self):
+        """括号不配对时 PubMed 会静默返回错误结果，必须在本地拦住"""
+        self.assertEqual(settings.PUBMED_QUERY.count("("),
+                         settings.PUBMED_QUERY.count(")"))
+
+
 if __name__ == "__main__":
     unittest.main()

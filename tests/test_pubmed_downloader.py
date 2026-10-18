@@ -254,5 +254,136 @@ class TestRequestRetry(unittest.TestCase):
         mock_sleep.assert_called_once_with(2)
 
 
+class TestPmidListProvenance(unittest.TestCase):
+    """pmid_list.json 记录的来源检索词必须与实际检索一致。
+
+    否则 `--query` 自定义检索后，增量对比会把整批文献当成「移除+新增」。
+    """
+
+    def _run(self, **kwargs):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from downloader.pubmed_downloader import download_xml_batches
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("downloader.pubmed_downloader._download_single_batch",
+                       return_value=None):
+                download_xml_batches(["1", "2"], out_dir=Path(tmp), **kwargs)
+            with open(Path(tmp) / "pmid_list.json", encoding="utf-8") as f:
+                return json.load(f)
+
+    def test_custom_query_is_recorded(self):
+        data = self._run(query="potato CRISPR")
+        self.assertEqual(data["query"], "potato CRISPR")
+        self.assertEqual(data["pmids"], ["1", "2"])
+
+    def test_omitted_query_falls_back_to_settings(self):
+        from config.settings import PUBMED_QUERY
+        self.assertEqual(self._run()["query"], PUBMED_QUERY)
+
+
+class TestStaleBatchArchiving(unittest.TestCase):
+    """检索词变化时必须归档旧批次，否则断点续传会把旧数据当新数据跳过。
+
+    实测事故：换检索式后重下 105 个批次全被跳过，实际一篇都没更新。
+    """
+
+    def _prepare(self, tmp, old_query):
+        import json
+        from pathlib import Path
+        root = Path(tmp)
+        (root / "batch_00000.xml").write_text("<x/>", encoding="utf-8")
+        (root / "batch_00001.xml").write_text("<x/>", encoding="utf-8")
+        with open(root / "pmid_list.json", "w", encoding="utf-8") as f:
+            json.dump({"query": old_query, "total": 0, "pmids": []}, f)
+        return root
+
+    def _run(self, root, **kwargs):
+        from unittest.mock import patch
+        from downloader.pubmed_downloader import download_xml_batches
+        with patch("downloader.pubmed_downloader._download_single_batch",
+                   return_value=None):
+            download_xml_batches(["1"], out_dir=root, **kwargs)
+
+    def test_query_change_archives_old_batches(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._prepare(tmp, "old query")
+            self._run(root, query="new query")
+            self.assertEqual(list(Path(root).glob("batch_*.xml")), [])
+            archived = list(Path(root).glob("_archive_*/batch_*.xml"))
+            self.assertEqual(len(archived), 2)
+
+    def test_same_query_keeps_batches(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._prepare(tmp, "same query")
+            self._run(root, query="same query")
+            self.assertEqual(len(list(Path(root).glob("batch_*.xml"))), 2)
+            self.assertEqual(list(Path(root).glob("_archive_*")), [])
+
+    def test_first_run_without_pmid_list_archives_nothing(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "batch_00000.xml").write_text("<x/>", encoding="utf-8")
+            self._run(root, query="any query")
+            self.assertEqual(len(list(root.glob("batch_*.xml"))), 1)
+
+
+class TestBatchIndexContinuation(unittest.TestCase):
+    """增量下载必须续写批次编号。
+
+    从 0 重新编号会撞上已有文件被断点续传跳过，新增文献静默丢失。
+    """
+
+    def test_next_index_is_max_plus_one(self):
+        import tempfile
+        from pathlib import Path
+        from downloader.pubmed_downloader import _next_batch_index
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for idx in (0, 3, 17):
+                (root / f"batch_{idx:05d}.xml").write_text("<x/>", encoding="utf-8")
+            self.assertEqual(_next_batch_index(root), 18)
+
+    def test_next_index_on_empty_dir_is_zero(self):
+        import tempfile
+        from pathlib import Path
+        from downloader.pubmed_downloader import _next_batch_index
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(_next_batch_index(Path(tmp)), 0)
+
+    def test_download_writes_new_files_beyond_existing(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from downloader.pubmed_downloader import download_xml_batches
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "batch_00000.xml").write_text("<old/>", encoding="utf-8")
+            written = []
+
+            def fake(idx, chunk, out_dir, batch_size, total, seq=None):
+                path = Path(out_dir) / f"batch_{idx:05d}.xml"
+                path.write_text("<new/>", encoding="utf-8")
+                written.append(path.name)
+                return path
+
+            with patch("downloader.pubmed_downloader._download_single_batch", fake):
+                download_xml_batches(["1", "2"], out_dir=root, batch_size=1)
+
+            self.assertEqual(sorted(written),
+                             ["batch_00001.xml", "batch_00002.xml"])
+            # 旧文件未被覆盖
+            self.assertEqual((root / "batch_00000.xml").read_text(encoding="utf-8"),
+                             "<old/>")
+
+
 if __name__ == "__main__":
     unittest.main()

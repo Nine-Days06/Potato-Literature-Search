@@ -23,6 +23,24 @@ PROC_DIR    = DATA_DIR / "processed"
 OUTPUT_DIR  = DATA_DIR / "output"
 LOG_DIR     = BASE_DIR / "logs"
 
+# ── data/output 子目录（相对 OUTPUT_DIR）───────────────────────
+# 按用途分开，导出再按全量/增量分开：根目录只留子目录，避免几十个
+# CSV 混在一起看不出哪个是最新交付件。
+# 各模块不要直接拼字符串，统一走各自的 `_output_dir(SUBDIR_*)` 助手，
+# 它按**调用时**的模块级 OUTPUT_DIR 重新派生，测试 patch OUTPUT_DIR 即可重定向。
+SUBDIR_EXPORT_FULL        = "exports/full"         # 全量交付 CSV
+SUBDIR_EXPORT_INCREMENTAL = "exports/incremental"  # 增量交付 CSV
+SUBDIR_REVIEW             = "review"               # 待人工复核清单
+SUBDIR_FAILURE            = "failures"             # 失败清单（LLM / PDF）
+SUBDIR_CACHE              = "cache"                # 检查点与批次中间件
+OUTPUT_SUBDIRS = [
+    SUBDIR_EXPORT_FULL,
+    SUBDIR_EXPORT_INCREMENTAL,
+    SUBDIR_REVIEW,
+    SUBDIR_FAILURE,
+    SUBDIR_CACHE,
+]
+
 # PDF 存储路径
 PDF_DIR = DATA_DIR / "pdfs"
 
@@ -51,21 +69,52 @@ EFETCH_BATCH_SIZE = 300
 # ── 搜索策略 ─────────────────────────────────────────────────
 # 全量马铃薯文献检索：不限定研究方向，
 # 分子生物学、遗传育种、栽培生理、植保、加工储藏、品质营养、产业经济等均收录
-# 结构：马铃薯核心实体 - 排除甘薯（甘薯/红薯 Ipomoea batatas 是旋花科，与马铃薯无关）
+# 结构：马铃薯核心实体（含栽培种 + 野生近缘种） - 排除纯甘薯文献
+#
+# 2026-10 检索式收紧（实测数据见 README「检索式调优」）：
+#   1. 补 18 个野生近缘种（Solanum sect. Petota）。它们在 MeSH 里没有独立主题词，
+#      只能靠 TIAB 补，旧式漏掉 71 篇、其中 77.5% 判为相关。
+#   2. 甘薯排除从「命中即排除」改为「命中且无马铃薯学名证据才排除」。
+#      旧式误伤 142 篇真正同时研究两者的文献（其中 30.3% 判为相关）。
 
-# 1. 核心实体（马铃薯，含普通马铃薯及其近缘种/野生种）
+# 1. 核心实体（栽培马铃薯）
 POTATO_CORE = (
     'potato[Title/Abstract] OR "Solanum tuberosum"[Title/Abstract] '
     'OR "Solanum tuberosum"[MeSH Terms] OR "Solanum sect. Petota"[MeSH Terms]'
 )
 
-# 2. 排除项：仅排除研究对象无关的干扰项（甘薯不是马铃薯）
-EXCLUSIONS = (
-    'NOT ("sweet potato"[Title/Abstract] OR "Ipomoea batatas"[Title/Abstract])'
+# 2. 野生近缘种（Solanum sect. Petota 组内）。
+#    只写物种名、不写 potato，因此不会与 POTATO_CORE 重叠；
+#    实测 436 篇里 365 篇已被 CORE 覆盖，净增 66 篇。
+WILD_SPECIES = [
+    "Solanum phureja", "Solanum andigena", "Solanum andigenum",
+    "Solanum juzepczukii", "Solanum curtilobum", "Solanum ajanhuiri",
+    "Solanum stenotomum", "Solanum goniocalyx", "Solanum chaucha",
+    "Solanum chacoense", "Solanum bulbocastanum", "Solanum commersonii",
+    "Solanum demissum", "Solanum stoloniferum", "Solanum pinnatisectum",
+    "Solanum verrucosum", "Solanum microdontum", "Solanum okadae",
+]
+POTATO_RELATIVES = "(" + " OR ".join(
+    f'"{name}"[Title/Abstract]' for name in WILD_SPECIES) + ")"
+
+# 3. 干扰项：甘薯（Ipomoea batatas）是旋花科，与马铃薯无关
+SWEET_POTATO = '("sweet potato"[Title/Abstract] OR "Ipomoea batatas"[Title/Abstract])'
+
+# 4. 「马铃薯学名证据」——用于在甘薯子句命中时救回两者同研的文献。
+#    学名只认 Solanum tuberosum：甘薯论文里的 "potato" 指的就是甘薯，
+#    拿 potato 当证据等于没排除。
+TUBEROSUM_EVIDENCE = (
+    '("Solanum tuberosum"[Title/Abstract] OR "Solanum tuberosum"[MeSH Terms])'
 )
 
-# 最终组合查询：马铃薯核心实体，排除甘薯
-PUBMED_QUERY = f"({POTATO_CORE}) {EXCLUSIONS}"
+# 5. 排除项：只排除「提甘薯且无马铃薯学名证据」的文献。
+#    必须写成 `A NOT (B NOT C)`，不能写 `A AND NOT (B NOT C)`——
+#    实测 PubMed 的 `A AND NOT B` 会退化成交集语义，返回完全错误的结果。
+EXCLUSIONS = f"NOT ({SWEET_POTATO} NOT {TUBEROSUM_EVIDENCE})"
+
+# 最终组合查询：栽培种 + 野生近缘种，排除纯甘薯文献
+# 括号保留：与实测验证过的候选式逐字符一致，改动前先重跑 tests/test_settings.py 的检索式测试
+PUBMED_QUERY = f"(({POTATO_CORE}) OR {POTATO_RELATIVES}) {EXCLUSIONS}"
 
 # 文献时间范围
 SEARCH_YEAR_MIN = 1800
