@@ -10,6 +10,7 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).res
 
 from config.settings import OUTPUT_DIR, PDF_DIR
 from downloader.fulltext_library import logger
+from utils.audit import record
 
 HANDOFF = Path(OUTPUT_DIR) / "handoff"
 DEST = HANDOFF / "delivery"
@@ -151,6 +152,8 @@ def main() -> int:
             shutil.copy2(src, DEST / "replace" / row["filename"])
             entry.update(size=src.stat().st_size, md5=md5(src))
         manifest.append(entry)
+        record(f"package_{row['action']}", row["pmid"], src if row["action"] == "replace" else None,
+               package=DEST.name)
 
     with open(DEST / "manifest.csv", "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(manifest[0]))

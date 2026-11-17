@@ -37,6 +37,7 @@ from downloader.fulltext_library import (
     load_records,
     logger,
 )
+from utils.audit import record
 
 _RECORDS: dict[str, dict] = {}
 
@@ -100,10 +101,10 @@ def doi_records() -> dict[str, dict]:
     return {doi_to_stem(r["doi"]): r for r in records.values() if r["doi"]}
 
 
-def write_csv(rows: list[dict]) -> Path:
+def write_csv(rows: list[dict], prefix: str = "fulltext_integrity") -> Path:
     out_dir = _output_dir(SUBDIR_FAILURE)
     out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / f"fulltext_integrity_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    csv_path = out_dir / f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}.csv"
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as fh:
         writer = csv.DictWriter(fh, fieldnames=INTEGRITY_FIELDS)
         writer.writeheader()
@@ -120,6 +121,8 @@ def quarantine(rows: list[dict]) -> int:
             continue
         src = Path(PDF_DIR) / row["file"]
         if src.exists():
+            record("quarantine", row["pmid"], src, verdict=row["verdict"],
+                   reason=row["reason"], source="check_integrity")
             shutil.move(str(src), str(dest / row["file"]))
             moved += 1
     return moved
@@ -176,7 +179,9 @@ def main() -> int:
             except Exception as exc:
                 logger.warning(f"MinerU 重判失败，保留原判定：{exc}")
 
-    csv_path = write_csv(rows)
+    # 抽样/按 PMID 的局部分析单独命名，避免被 `_latest("fulltext_integrity_*")` 当成全库基线。
+    prefix = "partial_fulltext_integrity" if (args.pmids or args.limit) else "fulltext_integrity"
+    csv_path = write_csv(rows, prefix=prefix)
     counts = Counter(row["verdict"] for row in rows)
     logger.info(f"体检完成 {len(rows)} 篇，耗时 {time.time() - start:.0f}s：")
     for verdict, count in counts.most_common():

@@ -19,6 +19,7 @@ if __package__ in (None, ""):
 
 from config.settings import OUTPUT_DIR, PDF_DIR, SUBDIR_EXPORT_FULL
 from downloader.fulltext_library import existing_fulltext_path
+from utils.audit import record
 
 # 目标下载器的合法 PDF 下限：首 4 字节 %PDF 且 ≥10KB。
 MIN_VALID_BYTES = 10 * 1024
@@ -109,6 +110,8 @@ def run_import(manifest_path: Path, source_dir: Path, apply: bool) -> Counter:
                     raise FileExistsError(target)
                 tmp.replace(target)
                 shutil.copystat(row["source"], target)
+                record("import", row["pmid"], target, doi=row["doi"],
+                       source="import_missing_fulltext")
             except FileExistsError:
                 tmp.unlink(missing_ok=True)
                 counts["exists"] += 1

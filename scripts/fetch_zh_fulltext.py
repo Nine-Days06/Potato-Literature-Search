@@ -23,6 +23,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config.settings import DATA_DIR, PDF_DIR  # noqa: E402
+from utils.audit import record
 
 CSV_PATH = DATA_DIR / "output" / "handoff" / "中文文献待下载_20261116.csv"
 STATE_PATH = DATA_DIR / "output" / "cache" / "zh_cn_download_state.json"
@@ -154,6 +155,7 @@ class Fetcher:
         part = target.with_suffix(".pdf.part")
         part.write_bytes(content)
         part.replace(target)
+        record("import", pmid, target, source="fetch_zh", url=pdf_url)
         return len(content)
 
     def explain_blocked(self, pdf_url: str) -> None:

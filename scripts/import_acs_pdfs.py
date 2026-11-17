@@ -23,6 +23,7 @@ from config.settings import DB_PATH, PDF_DIR
 from downloader.pdf_downloader import _existing_fulltext_path
 from downloader.fulltext_library import relevant_pmids
 from export_missing_fulltext import normalize_doi
+from utils.audit import record
 
 DOI_PREFIX = "10.1021/"
 MIN_VALID_BYTES = 10 * 1024
@@ -84,6 +85,7 @@ def main() -> int:
             part = target.with_suffix(".pdf.part")
             shutil.copy2(path, part)
             part.replace(target)
+            record("import", pmid, target, source="import_acs")
 
     for line in copied_pmids[:20]:
         print("  ", line)

@@ -21,11 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from config.settings import OUTPUT_DIR, PDF_DIR, SUBDIR_FAILURE
+from utils.audit import record
 
 
 def _latest(pattern: str) -> Path | None:
     files = sorted((Path(OUTPUT_DIR) / SUBDIR_FAILURE).glob(pattern))
-    return files[-1] if files else None
+    # 按修改时间取最新：文件名排序会把 `..._mineru_final_2026...` 排到数字日期之后。
+    return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
 def _load(path: Path) -> list[dict]:
@@ -51,7 +53,11 @@ def main() -> int:
             if r.get("identity") and r["identity"] != "ERROR":
                 llm[r["pmid"]] = r["identity"]
 
-    verdict = {r["pmid"]: mineru.get(r["pmid"], r["verdict"]) for r in rows}
+    # 只有体检还停在 unparsed/no_text 时才吃 MinerU 结论：全库体检现在已自动重判，
+    # 过时的 mineru CSV 不能覆盖新的 mismatch 等判定。
+    verdict = {r["pmid"]: (mineru[r["pmid"]] if r["verdict"] in ("unparsed", "no_text")
+                           and r["pmid"] in mineru else r["verdict"])
+               for r in rows}
     keep = {p for p, v in verdict.items()
             if v in KEEP_VERDICTS or (v == "weak" and llm.get(p) == "MATCH")}
     drop = [r for r in rows if r["pmid"] not in keep]
@@ -78,6 +84,8 @@ def main() -> int:
             if not path.exists():
                 continue
             size_kb = round(path.stat().st_size / 1024, 1)
+            record("delete", row["pmid"], path, verdict=verdict[row["pmid"]],
+                   reason=row["reason"], source="prune")
             path.unlink()
             written += 1
             writer.writerow({"pmid": row["pmid"], "file": row["file"],

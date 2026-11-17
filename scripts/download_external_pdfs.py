@@ -26,6 +26,7 @@ if __package__ in (None, ""):
 from config.settings import EXTERNAL_PDF_DIR, OUTPUT_DIR, PROXY, SUBDIR_FAILURE
 from scripts.import_missing_fulltext import doi_to_stem
 from scripts.import_site_literature import latest_harvest, load_rows
+from utils.audit import record
 
 MIN_BYTES = 10 * 1024
 UA = "Mozilla/5.0 (compatible; potato-lit/1.0)"
@@ -120,6 +121,9 @@ def main() -> None:
             status, _ = future.result()
             if status != "ok":
                 failures.append((row["doi"], row["oa_pdf_url"], status))
+            else:
+                record("download", row.get("pmid", ""), target, doi=row["doi"],
+                       source="external_oa", url=row["oa_pdf_url"])
             if i % 100 == 0:
                 print(f"{i}/{len(todo)}", flush=True)
 

@@ -21,6 +21,7 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).res
 
 from config.settings import DB_PATH, OUTPUT_DIR, PDF_DIR
 from downloader.fulltext_library import FULLTEXT_SUFFIXES, load_records, logger
+from utils.audit import record
 from utils.db import get_conn
 
 CACHE = Path(OUTPUT_DIR) / "cache" / "notice_update_to.json"
@@ -82,7 +83,9 @@ def main() -> int:
     for m in moves:
         dest_dir = DEST_ROOT / m["reason"]
         dest_dir.mkdir(parents=True, exist_ok=True)
-        (Path(PDF_DIR) / m["file"]).replace(dest_dir / m["file"])
+        source = Path(PDF_DIR) / m["file"]
+        record("exclude", m["pmid"], source, reason=m["reason"], source="exclude_notice")
+        source.replace(dest_dir / m["file"])
         excluded[m["pmid"]] = {**m, "moved_at": moved_at}
     EXCLUDED.write_text(json.dumps(excluded, ensure_ascii=False, indent=1), encoding="utf-8")
     logger.info(f"已移出 {len(moves)} 篇 -> {DEST_ROOT}；名单 {EXCLUDED.name} 共 {len(excluded)} 条")
