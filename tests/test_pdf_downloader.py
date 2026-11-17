@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch, Mock
 import io
+import sqlite3
 import tarfile
 import tempfile
 import csv
@@ -12,6 +13,7 @@ from downloader.pdf_downloader import (
     normalize_pmc_id,
     fetch_oa_links,
     load_cached_oa_links,
+    is_valid_pdf_file,
     download_pdf_file,
     download_pdf_from_tgz,
     download_oa_pdf,
@@ -229,7 +231,7 @@ class TestLoadCachedOaLinks(unittest.TestCase):
 class TestDownloadPdfFromTgz(unittest.TestCase):
     @patch("downloader.pdf_downloader.subprocess.run")
     def test_should_extract_pdf_file_from_tgz(self, mock_run):
-        pdf_payload = b"%PDF-1.4\n" + (b"A" * 3000)
+        pdf_payload = b"%PDF-1.4\n" + (b"A" * 3000) + b"\n%%EOF" + b"\n%%EOF"
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:gz") as tar:
             info = tarfile.TarInfo(name="paper.pdf")
@@ -315,7 +317,7 @@ class TestDownloadPdfFromTgzTxtFallback(unittest.TestCase):
 
     @patch("downloader.pdf_downloader.subprocess.run")
     def test_should_still_extract_pdf_when_pdf_present(self, mock_run):
-        pdf_payload = b"%PDF-1.4\n" + (b"A" * 3000)
+        pdf_payload = b"%PDF-1.4\n" + (b"A" * 3000) + b"\n%%EOF" + b"\n%%EOF"
         tgz_bytes = self._make_tgz([
             ("PMC1/main.pdf", pdf_payload),
             ("PMC1/main.nxml", self.NXML),
@@ -346,8 +348,8 @@ class TestDownloadPdfFromTgzTxtFallback(unittest.TestCase):
 class TestDownloadPdfFromTgzPicksArticlePdf(unittest.TestCase):
     @patch("downloader.pdf_downloader.subprocess.run")
     def test_should_pick_article_pdf_when_supplementary_pdf_comes_first(self, mock_run):
-        article_pdf_payload = b"%PDF-1.4\n" + (b"ARTICLE-CONTENT-ABCD" * 300)
-        supp_pdf_payload = b"%PDF-1.4\n" + (b"SUPPLEMENT-FIGURES-TABLES-YZ" * 300)
+        article_pdf_payload = b"%PDF-1.4\n" + (b"ARTICLE-CONTENT-ABCD" * 300) + b"\n%%EOF" + b"\n%%EOF"
+        supp_pdf_payload = b"%PDF-1.4\n" + (b"SUPPLEMENT-FIGURES-TABLES-YZ" * 300) + b"\n%%EOF" + b"\n%%EOF"
         buf = io.BytesIO()
 
         def add_member(tar, name, data):
@@ -454,7 +456,7 @@ class TestDownloadOaPdf(unittest.TestCase):
 class TestAria2Download(unittest.TestCase):
     @patch("downloader.pdf_downloader.subprocess.run")
     def test_should_download_pdf_file_via_aria2c(self, mock_run):
-        pdf_payload = b"%PDF-1.4\n" + (b"B" * 3000)
+        pdf_payload = b"%PDF-1.4\n" + (b"B" * 3000) + b"\n%%EOF" + b"\n%%EOF" + b"\n%%EOF" + b"\n%%EOF"
 
         def fake_run(cmd, capture_output=True, text=True, timeout=300, check=False):
             out_dir = Path(cmd[cmd.index("-d") + 1])
@@ -502,7 +504,7 @@ class TestAria2Download(unittest.TestCase):
 class TestAria2Proxy(unittest.TestCase):
     @patch("downloader.pdf_downloader.subprocess.run")
     def test_should_append_proxy_arg_when_configured(self, mock_run):
-        payload = b"%PDF-1.4\n" + (b"B" * 3000)
+        payload = b"%PDF-1.4\n" + (b"B" * 3000) + b"\n%%EOF" + b"\n%%EOF"
 
         def fake_run(cmd, capture_output=True, text=True, timeout=300, check=False):
             out_dir = Path(cmd[cmd.index("-d") + 1])
@@ -521,7 +523,7 @@ class TestAria2Proxy(unittest.TestCase):
 
     @patch("downloader.pdf_downloader.subprocess.run")
     def test_should_not_append_proxy_arg_when_not_configured(self, mock_run):
-        payload = b"%PDF-1.4\n" + (b"B" * 3000)
+        payload = b"%PDF-1.4\n" + (b"B" * 3000) + b"\n%%EOF" + b"\n%%EOF"
 
         def fake_run(cmd, capture_output=True, text=True, timeout=300, check=False):
             out_dir = Path(cmd[cmd.index("-d") + 1])
@@ -537,6 +539,27 @@ class TestAria2Proxy(unittest.TestCase):
         self.assertTrue(ok)
         called_cmd = mock_run.call_args.args[0]
         self.assertNotIn("--all-proxy", " ".join(called_cmd))
+
+
+class TestAria2WinTlsFallback(unittest.TestCase):
+    @patch("downloader.pdf_downloader._run_requests_download", return_value=True)
+    @patch("downloader.pdf_downloader.subprocess.run")
+    def test_should_fall_back_to_requests_and_disable_aria2(self, mock_run, mock_requests):
+        import downloader.pdf_downloader as pd
+
+        pd._ARIA2_DISABLED = False
+        mock_run.return_value = Mock(
+            returncode=1, stderr="Failed to initialize WinTLS context handle", stdout=""
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(pd._run_aria2c_download("https://e.org/1.pdf", Path(td) / "1.pdf"))
+            self.assertTrue(pd._run_aria2c_download("https://e.org/2.pdf", Path(td) / "2.pdf"))
+
+        self.assertTrue(pd._ARIA2_DISABLED)
+        self.assertEqual(mock_run.call_count, 1)
+        self.assertEqual(mock_requests.call_count, 2)
+        pd._ARIA2_DISABLED = False
 
 
 class TestFetchOaLinksProxy(unittest.TestCase):
@@ -892,6 +915,17 @@ class TestLoadFailedItemsFromCsv(unittest.TestCase):
 
 
 class TestRunPdfRetry(unittest.TestCase):
+    def setUp(self):
+        pmids = {"111", "222", "333", "444"} | {str(i) for i in range(1, 16)}
+        self._relevant = patch(
+            "downloader.fulltext_library.relevant_pmids",
+            return_value=pmids,
+        )
+        self._relevant.start()
+
+    def tearDown(self):
+        self._relevant.stop()
+
     @patch("downloader.pdf_downloader._load_pdf_checkpoint")
     @patch("downloader.pdf_downloader.load_failed_items_from_csv")
     @patch("downloader.pdf_downloader.fetch_oa_links")
@@ -903,10 +937,10 @@ class TestRunPdfRetry(unittest.TestCase):
         mock_csv, mock_checkpoint,
     ):
         mock_dl.return_value = True
-        mock_fetch.return_value = ({}, [])
+        mock_fetch.return_value = ({}, ["PMC1"])
         with tempfile.TemporaryDirectory() as td:
             pdf_dir = Path(td)
-            (pdf_dir / "222.pdf").write_bytes(b"%PDF-1.4\n" + b"A" * 2000)
+            (pdf_dir / "222.pdf").write_bytes(b"%PDF-1.4\n" + b"A" * 2000 + b"\n%%EOF")
             mock_checkpoint.return_value = [
                 {"pmid": "111", "pmc_id": "PMC1", "links": {}},
                 {"pmid": "222", "pmc_id": "PMC2", "links": {"pdf": "https://a/2.pdf"}},
@@ -919,6 +953,30 @@ class TestRunPdfRetry(unittest.TestCase):
         mock_fetch.assert_called_once()       # 仅 PMC1 无链接需重查
         mock_dl.assert_called_once()          # 222.pdf 已存在被过滤，仅 111 需下载
         mock_clear.assert_called_once()       # 全部处理后清除
+
+    @patch("downloader.pdf_downloader._load_pdf_checkpoint")
+    @patch("downloader.pdf_downloader.load_failed_items_from_csv")
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.export_failed_links_csv")
+    @patch("downloader.pdf_downloader._clear_pdf_checkpoint")
+    def test_should_drop_non_oa_items_without_retrying(
+        self, mock_clear, mock_export_csv, mock_dl, mock_fetch,
+        mock_csv, mock_checkpoint,
+    ):
+        """查链后确认非 OA 的条目必须丢弃，否则检查点永远清不掉。"""
+        mock_fetch.return_value = ({}, [])  # 无链接、也无网络故障
+        mock_checkpoint.return_value = [
+            {"pmid": "111", "pmc_id": "PMC1", "links": {}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            with patch("downloader.pdf_downloader.PDF_DIR", Path(td)):
+                from downloader.pdf_downloader import run_pdf_retry
+                run_pdf_retry()
+
+        mock_dl.assert_not_called()
+        mock_export_csv.assert_not_called()
+        mock_clear.assert_called_once()
 
     @patch("downloader.pdf_downloader._load_pdf_checkpoint")
     @patch("downloader.pdf_downloader.load_failed_items_from_csv")
@@ -1110,6 +1168,37 @@ class TestRunPdfWriteCheckpoint(unittest.TestCase):
         conn.commit()
         conn.close()
         return db
+
+    @patch("downloader.pdf_downloader.fetch_oa_links")
+    @patch("downloader.pdf_downloader.download_oa_pdf")
+    @patch("downloader.pdf_downloader.load_cached_oa_links")
+    @patch("downloader.pdf_downloader.export_oa_links_csv")
+    def test_should_only_fetch_relevant_articles(
+        self, mock_export_csv, mock_cached, mock_dl, mock_fetch,
+    ):
+        mock_cached.return_value = {}
+        mock_fetch.return_value = ({}, [])
+        mock_export_csv.return_value = Path("links.csv")
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            db = self._make_db_with_pmc(td_path)
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "INSERT INTO articles (pmid, pmc_id) VALUES (?, ?)",
+                ("2222", "PMC2"),
+            )
+            conn.execute(
+                "INSERT INTO llm_validation (pmid, llm_verdict) "
+                "VALUES (?, 'NOT_RELEVANT')",
+                ("2222",),
+            )
+            conn.commit()
+            conn.close()
+            with patch("downloader.pdf_downloader.PDF_DIR", td_path):
+                with patch("downloader.pdf_downloader.OUTPUT_DIR", td_path):
+                    from downloader.pdf_downloader import run_pdf_download
+                    run_pdf_download(db_path=db)
+        self.assertEqual(mock_fetch.call_args.args[0], ["PMC1"])
 
     @patch("downloader.pdf_downloader.fetch_oa_links")
     @patch("downloader.pdf_downloader.download_oa_pdf")
@@ -1590,7 +1679,46 @@ class TestDownloadOaPdfTxtFallback(unittest.TestCase):
             result = download_oa_pdf(links, dest_path)
             
             self.assertTrue(result)
-            mock_download_pdf.assert_called_once_with("https://example.org/test.txt", dest_path.with_suffix(".txt"))
+            mock_download_pdf.assert_called_once_with(
+                "https://example.org/test.txt",
+                dest_path.with_suffix(".txt"),
+                expect_pdf=False,
+            )
+
+
+class TestPdfContentValidation(unittest.TestCase):
+    """Cloudflare 页 / 截断文件不得冒充 PDF 入库。"""
+
+    def test_html_page_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "x.pdf"
+            path.write_bytes(b"<!DOCTYPE html><title>Just a moment...</title>" + b" " * 2048)
+            self.assertFalse(is_valid_pdf_file(path))
+
+    def test_truncated_pdf_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "x.pdf"
+            path.write_bytes(b"%PDF-1.4\n" + b"A" * 8192)  # 无 %%EOF
+            self.assertFalse(is_valid_pdf_file(path))
+
+    def test_complete_pdf_is_accepted(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "x.pdf"
+            path.write_bytes(b"%PDF-1.4\n" + b"A" * 8192 + b"\n%%EOF\n")
+            self.assertTrue(is_valid_pdf_file(path))
+
+    @patch("downloader.pdf_downloader.subprocess.run")
+    def test_download_pdf_file_rejects_challenge_page(self, mock_run):
+        def fake_run(cmd, capture_output=True, text=True, timeout=300, check=False):
+            out_path = Path(cmd[cmd.index("-d") + 1]) / cmd[cmd.index("-o") + 1]
+            out_path.write_bytes(b"<html>Just a moment...</html>" + b" " * 3000)
+            return Mock(returncode=0, stderr="", stdout="")
+
+        mock_run.side_effect = fake_run
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "x.pdf"
+            self.assertFalse(download_pdf_file("https://example.org/x.pdf", dest))
+            self.assertFalse(dest.exists())
 
 
 if __name__ == "__main__":

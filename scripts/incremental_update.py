@@ -244,6 +244,10 @@ def main():
         if field_paths:
             logger.info(f"按研究方向拆分导出: {len(field_paths)} 个文件")
 
+    # 按全量相关集清理：增量只更新 CSV，翻转删除必须看全库
+    from downloader.fulltext_library import prune_relevant_fulltext
+    prune_relevant_fulltext()
+
     logger.info("=" * 60)
     logger.info("✅ 增量更新流水线完成")
     logger.info(f"输出目录: {RAW_XML_DIR.parent / 'output'}")

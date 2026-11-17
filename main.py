@@ -8,7 +8,10 @@
   python main.py --step download   # 仅下载 XML
   python main.py --step parse      # 仅解析 XML → SQLite
   python main.py --step clean      # 仅硬过滤
-  python main.py --step pdf        # 下载 OA 全文（需先跑 LLM 验证）
+  python main.py --step pdf        # 下载相关文献 OA 全文到 data/pdfs_relevant/
+  python main.py --step pdf-retry  # 仅重试失败的 OA 全文下载
+    python main.py --step tdm-plan   # 生成 TDM 下载计划（Wiley/Elsevier/Springer，不下载）
+  python main.py --step tdm --yes  # 执行 TDM 下载（不加 --yes 只打印计划）
   python main.py --step validate   # LLM 二次验证（需配置 DEEPSEEK_API_KEY / ZHIPU_API_KEY / OPENAI_API_KEY）
 python main.py --step import-review  # 导入人工复核结果
   python main.py --step export         # 导出复核通过文献的原始信息 CSV
@@ -57,6 +60,23 @@ def step_pdf_retry():
     run_pdf_retry(db_path=DB_PATH)
 
 
+def step_tdm_plan():
+    """只生成 TDM 下载计划（不下载），作为下载前确认材料"""
+    from downloader.tdm_downloader import run_tdm_plan
+    return run_tdm_plan(db_path=DB_PATH)
+
+
+def step_tdm(confirm=False, plan_path=None, limit=None):
+    """执行 TDM 下载。未传 --yes 时只打印计划，不发起任何请求。"""
+    from downloader.tdm_downloader import run_tdm_download
+    return run_tdm_download(
+        db_path=DB_PATH,
+        plan_path=Path(plan_path) if plan_path else None,
+        confirm=confirm,
+        limit=limit,
+    )
+
+
 def step_validate(batch=False):
     from cleaner.llm_validator import run_validation
     run_validation(batch_mode=batch)
@@ -97,6 +117,10 @@ def step_export():
         logger.info(f"按研究方向拆分导出: {len(field_paths)} 个文件"
                     f"（每个方向目录内含 LLM 版 + raw 版）")
 
+    # 删除判定翻转后残留在相关全文库的副本
+    from downloader.fulltext_library import prune_relevant_fulltext
+    prune_relevant_fulltext(db_path=DB_PATH)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -104,7 +128,8 @@ def main():
     )
     parser.add_argument(
         "--step",
-        choices=["download", "parse", "clean", "pdf", "pdf-retry", "validate", "import-review", "export", "all"],
+        choices=["download", "parse", "clean", "pdf", "pdf-retry", "validate",
+                 "import-review", "export", "tdm-plan", "tdm", "all"],
         default="all",
         help="运行指定阶段（默认 all）",
     )
@@ -127,6 +152,22 @@ def main():
         "--batch",
         action="store_true",
         help="使用智谱 Batch API 进行 LLM 验证（仅 zhipu provider 有效）",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="确认执行 TDM 下载（不加时 tdm 阶段只打印计划，不发请求）",
+    )
+    parser.add_argument(
+        "--plan",
+        default=None,
+        help="TDM 计划清单 CSV 路径（默认按数据库实时重算）",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="TDM 本次最多处理多少篇（用于小批量试跑）",
     )
     args = parser.parse_args()
 
@@ -157,6 +198,12 @@ def main():
 
     if step == "pdf-retry":
         step_pdf_retry()
+
+    if step == "tdm-plan":
+        step_tdm_plan()
+
+    if step == "tdm":
+        step_tdm(confirm=args.yes, plan_path=args.plan, limit=args.limit)
 
     if step == "validate":
         step_validate(args.batch)

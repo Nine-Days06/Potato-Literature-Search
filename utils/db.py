@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS articles (
     authors       TEXT,       -- '|' 分隔，"LastName FirstName" 格式
     affiliation   TEXT,       -- 第一作者单位
     language      TEXT,
-    raw_xml_file  TEXT        -- 来源 XML 批次文件名，便于溯源
+    raw_xml_file  TEXT,       -- 来源 XML 批次文件名，便于溯源
+    source        TEXT        -- NULL/pubmed = PubMed 管线；potato_ai = 站点补录
 );
 """
 
@@ -50,11 +51,25 @@ CREATE TABLE IF NOT EXISTS llm_validation (
 );
 """
 
+# 标题反查补 DOI 的溯源记录：后续统计「全文下载途径」时要能区分 PubMed 原生 DOI 与反查补录
+CREATE_DOI_BACKFILL_SQL = """
+CREATE TABLE IF NOT EXISTS doi_backfill (
+    pmid          TEXT PRIMARY KEY,
+    doi           TEXT,
+    sim           REAL,       -- 标题相似度
+    matched_title TEXT,
+    matched_year  INTEGER,
+    source        TEXT,       -- 'crossref:query.bibliographic'
+    created_at    TEXT
+);
+"""
+
 # 增量列迁移：(表名, 列名, 列定义)
 # 老库靠 CREATE TABLE IF NOT EXISTS 不会补列，必须显式 ALTER TABLE。
 # 新增列时在此追加一条，已有库下次 init_db() 自动补齐。
 _ADDED_COLUMNS = [
     ("llm_validation", "research_field", "TEXT"),
+    ("articles", "source", "TEXT"),   # 'pubmed'（NULL 视同）/ 'potato_ai'（站点补录）
 ]
 
 
@@ -79,6 +94,7 @@ def init_db(db_path: Path) -> None:
         conn.execute(CREATE_ARTICLES_SQL)
         conn.execute(CREATE_FILTER_LOG_SQL)
         conn.execute(CREATE_LLM_VALIDATION_SQL)
+        conn.execute(CREATE_DOI_BACKFILL_SQL)
         _migrate_schema(conn)
         conn.commit()
     finally:

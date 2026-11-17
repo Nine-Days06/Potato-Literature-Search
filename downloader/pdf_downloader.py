@@ -2,7 +2,7 @@
 """
 PMC Open Access PDF 下载器
 流程：
-  1. 从数据库读取 LLM 判定相关的带有 PMC ID 的文献。
+  1. 从数据库读取复核通过且带有 PMC ID 的相关文献。
   2. 调用 PMC OA API 获取这些 PMC ID 对应的 PDF 下载链接。
   3. 转换为 HTTPS 链接并下载到指定目录。
   4. 支持断点续传（跳过已存在文件）。
@@ -32,6 +32,9 @@ from utils.logger import get_logger
 logger = get_logger("pdf_downloader", log_dir=LOG_DIR)
 
 MIN_VALID_FILE_BYTES = 1024
+# PDF 规范要求以 %%EOF 收尾；尾部窗口需覆盖结束注释等附加字节。
+PDF_EOF_WINDOW = 2048
+FULLTEXT_SUFFIXES = (".pdf", ".txt", ".xml")
 
 OA_FETCH_MAX_WORKERS = 8
 DOWNLOAD_MAX_WORKERS = 8
@@ -41,6 +44,8 @@ ARIA2C_SPLIT = "8"
 ARIA2C_MIN_SPLIT_SIZE = "1M"
 PDF_CHECKPOINT_FILENAME = "pdf_download_progress.json"
 RETRY_CHECKPOINT_INTERVAL = 10
+# 本机 Windows Schannel 损坏时 aria2c 必然失败，首次命中后不再浪费重试时间。
+_ARIA2_DISABLED = False
 
 
 def _output_dir(subdir: str) -> Path:
@@ -50,6 +55,15 @@ def _output_dir(subdir: str) -> Path:
     模块属性 `OUTPUT_DIR` 重定向输出，常量在 import 期就固化了。
     """
     return Path(OUTPUT_DIR) / subdir
+
+
+def _existing_fulltext_path(pmid: str) -> Path | None:
+    """相关全文库里该 PMID 已有的全文（PDF / 文本 / TDM XML），没有则 None。"""
+    for suffix in FULLTEXT_SUFFIXES:
+        path = PDF_DIR / f"{pmid}{suffix}"
+        if path.exists():
+            return path
+    return None
 
 # ── API 调用与解析 ───────────────────────────────────────────
 
@@ -551,7 +565,10 @@ def load_failed_items_from_csv(out_dir: Path | None = None) -> list[dict]:
 # ── 下载核心 ──────────────────────────────────────────────────
 
 def _run_aria2c_download(url: str, output_path: Path, timeout_sec: int = 300) -> bool:
+    global _ARIA2_DISABLED
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if _ARIA2_DISABLED:
+        return _run_requests_download(url, output_path, timeout_sec)
 
     cmd = [
         "aria2c",
@@ -597,9 +614,40 @@ def _run_aria2c_download(url: str, output_path: Path, timeout_sec: int = 300) ->
         if len(err_msg) > 300:
             err_msg = err_msg[-300:]
         logger.error(f"aria2c 下载失败: {url} -> {err_msg}")
+        if _run_requests_download(url, output_path, timeout_sec):
+            _ARIA2_DISABLED = True
+            logger.warning("aria2c 不可用，后续下载改用 requests。")
+            return True
         return False
 
     return output_path.exists()
+
+
+def _run_requests_download(url: str, output_path: Path, timeout_sec: int = 300) -> bool:
+    """aria2c 不可用时的回退下载，支持从 `.part` 文件断点续传。"""
+    headers = {}
+    mode = "wb"
+    if output_path.exists() and output_path.stat().st_size > 0:
+        headers["Range"] = f"bytes={output_path.stat().st_size}-"
+        mode = "ab"
+
+    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+    try:
+        with requests.get(
+            url, headers=headers, stream=True, timeout=(30, timeout_sec), proxies=proxies
+        ) as response:
+            response.raise_for_status()
+            if mode == "ab" and response.status_code != 206:
+                mode = "wb"
+            with open(output_path, mode) as f:
+                for chunk in response.iter_content(chunk_size=256 * 1024):
+                    if chunk:
+                        f.write(chunk)
+    except Exception as e:
+        logger.error(f"requests 下载失败: {url} -> {e}")
+        return False
+    return output_path.exists() and output_path.stat().st_size > 0
+
 
 def _cleanup_aria2_temp_files(temp_path: Path) -> None:
     """删除 aria2 下载中断残留的临时文件（含 .part.aria2 控制文件）。"""
@@ -610,12 +658,37 @@ def _cleanup_aria2_temp_files(temp_path: Path) -> None:
         aria2_control.unlink()
 
 
-def download_pdf_file(url: str, dest_path: Path) -> bool:
+def _is_valid_pdf_bytes(data: bytes) -> bool:
+    """挡住 Cloudflare/登录页等 HTML、截断下载与空壳文件。"""
+    return (
+        len(data) > MIN_VALID_FILE_BYTES
+        and data.startswith(b"%PDF")
+        and b"%%EOF" in data[-PDF_EOF_WINDOW:]
+    )
+
+
+def is_valid_pdf_file(path: Path) -> bool:
+    try:
+        size = path.stat().st_size
+        if size <= MIN_VALID_FILE_BYTES:
+            return False
+        with path.open("rb") as f:
+            head = f.read(5)
+            f.seek(max(0, size - PDF_EOF_WINDOW))
+            return head == b"%PDF-" and b"%%EOF" in f.read()
+    except OSError:
+        return False
+
+
+def download_pdf_file(url: str, dest_path: Path, expect_pdf: bool = True) -> bool:
     """
     下载单个 PDF 文件，支持断点续传（检查是否存在）。
     成功返回 True，失败返回 False。
     """
-    if dest_path.exists() and dest_path.stat().st_size > MIN_VALID_FILE_BYTES: 
+    valid = is_valid_pdf_file if expect_pdf else (
+        lambda p: p.exists() and p.stat().st_size > MIN_VALID_FILE_BYTES
+    )
+    if valid(dest_path):
         return True
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -625,8 +698,8 @@ def download_pdf_file(url: str, dest_path: Path) -> bool:
         if not _run_aria2c_download(url, temp_path):
             raise RuntimeError("aria2c 执行失败")
 
-        if temp_path.stat().st_size <= MIN_VALID_FILE_BYTES:
-            raise RuntimeError("下载文件过小，可能不是有效 PDF")
+        if not valid(temp_path):
+            raise RuntimeError("下载内容不是完整 PDF（多为登录页/挑战页/截断）")
 
         temp_path.replace(dest_path)
         return True
@@ -635,8 +708,8 @@ def download_pdf_file(url: str, dest_path: Path) -> bool:
         logger.error(f"  下载失败: {url} -> {e}")
 
         _cleanup_aria2_temp_files(temp_path)
-        if dest_path.exists() and dest_path.stat().st_size <= MIN_VALID_FILE_BYTES:
-            dest_path.unlink()
+        if dest_path.exists() and not valid(dest_path):
+            dest_path.unlink(missing_ok=True)
 
         return False
 
@@ -731,7 +804,7 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
     当 `oa.fcgi` 未返回 pdf 直链但包内已有 PDF 时可作为回退策略。
     包内有多个 PDF 时优先选择与 .nxml/.xml 同名的正文 PDF。
     """
-    if dest_path.exists() and dest_path.stat().st_size > MIN_VALID_FILE_BYTES:
+    if is_valid_pdf_file(dest_path):
         return True
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -761,22 +834,22 @@ def download_pdf_from_tgz(url: str, dest_path: Path) -> bool:
                 raise RuntimeError("无法读取 tgz 包内 PDF 文件")
             pdf_bytes = extracted.read()
 
-        if not pdf_bytes or len(pdf_bytes) <= MIN_VALID_FILE_BYTES:
-            raise RuntimeError("提取到的 PDF 过小，可能无效")
+        if not pdf_bytes or not _is_valid_pdf_bytes(pdf_bytes):
+            raise RuntimeError("提取到的 PDF 不是完整文件（过小/截断/无 %%EOF）")
 
         with open(temp_path, "wb") as f:
             f.write(pdf_bytes)
 
-        if temp_path.stat().st_size <= MIN_VALID_FILE_BYTES:
-            raise RuntimeError("PDF 文件过小，可能提取失败")
+        if not is_valid_pdf_file(temp_path):
+            raise RuntimeError("PDF 文件不完整（过小/截断/无 %%EOF）")
 
         temp_path.replace(dest_path)
         return True
     except Exception as e:
         logger.error(f"  TGZ->PDF 提取失败: {url} -> {e}")
         _cleanup_aria2_temp_files(temp_path)
-        if dest_path.exists() and dest_path.stat().st_size <= MIN_VALID_FILE_BYTES:
-            dest_path.unlink()
+        if dest_path.exists() and not is_valid_pdf_file(dest_path):
+            dest_path.unlink(missing_ok=True)
         return False
     finally:
         _cleanup_aria2_temp_files(tgz_temp_path)
@@ -800,14 +873,14 @@ def download_oa_pdf(links: dict[str, str], pdf_path: Path) -> bool:
         return True
 
     # 新增：TXT 回退路径
-    if txt_url and download_pdf_file(txt_url, pdf_path.with_suffix(".txt")):
+    if txt_url and download_pdf_file(txt_url, pdf_path.with_suffix(".txt"), expect_pdf=False):
         return True
 
     return False
 
 # ── 业务流程 ──────────────────────────────────────────────────
 
-def run_pdf_download(db_path: Path = DB_PATH):
+def run_pdf_download(db_path: Path = DB_PATH, pmids: set[str] | None = None):
     """
     执行 PDF 下载主流程。
     """
@@ -815,20 +888,24 @@ def run_pdf_download(db_path: Path = DB_PATH):
     logger.info("阶段四：下载 OA 全文（仅 PDF）")
     logger.info("=" * 60)
 
-    # 1. 查找高/中相关且有 PMC ID 的文献
+    # 1. 查找复核通过且有 PMC ID 的相关文献
     query = """
     SELECT a.pmid, a.pmc_id
     FROM articles a
-    JOIN llm_validation v ON a.pmid = v.pmid
-    WHERE (v.human_review = 'Y' OR (v.human_review IS NULL AND v.llm_verdict = 'RELEVANT'))
-      AND a.pmc_id IS NOT NULL AND a.pmc_id != ''
+    WHERE a.pmc_id IS NOT NULL AND a.pmc_id != ''
     """
     
+    from downloader.fulltext_library import relevant_pmids
+
     with get_conn(db_path) as conn:
         records = conn.execute(query).fetchall()
-        
+    relevant = relevant_pmids(db_path)
+    records = [r for r in records if r["pmid"] in relevant]
+    if pmids is not None:
+        records = [r for r in records if r["pmid"] in pmids]
+
     if not records:
-        logger.info("未发现符合下载条件（有 PMC ID 且 LLM 判定相关）的文献。")
+        logger.info("未发现符合下载条件的文献（需复核通过且有 PMC ID）。")
         return
 
     logger.info(f"符合条件的文献共 {len(records)} 篇，开始获取下载链接...")
@@ -875,15 +952,15 @@ def run_pdf_download(db_path: Path = DB_PATH):
     network_failed_items: list[dict] = []
     for pid in network_failed:
         info = pmc_to_info.get(pid, {})
-        pdf_path = PDF_DIR / f"{info.get('pmid', '')}.pdf"
-        if pdf_path.exists() or pdf_path.with_suffix(".txt").exists():
+        pmid = info.get("pmid", "")
+        if _existing_fulltext_path(pmid):
             skip_count += 1
             continue
         network_failed_items.append({
             "pmc_id": pid,
             "links": {},
-            "pdf_path": pdf_path,
-            "pmid": info.get("pmid", ""),
+            "pdf_path": PDF_DIR / f"{pmid}.pdf",
+            "pmid": pmid,
         })
 
     # 使用线程池并发下载，提高效率
@@ -894,7 +971,7 @@ def run_pdf_download(db_path: Path = DB_PATH):
             dest_dir = PDF_DIR
             pdf_path = dest_dir / f"{info['pmid']}.pdf"
 
-            if pdf_path.exists():
+            if _existing_fulltext_path(info["pmid"]):
                 skip_count += 1
                 continue
 
@@ -1009,9 +1086,17 @@ def run_pdf_retry(db_path: Path = DB_PATH):
             logger.info("无检查点且无失败清单，没有可重试项。")
             return
 
+    from downloader.fulltext_library import relevant_pmids
+
+    relevant = relevant_pmids(db_path)
+    before = len(pending)
+    pending = [item for item in pending if item.get("pmid") in relevant]
+    if len(pending) < before:
+        logger.info(f"过滤已翻转为不相关的待重试项 {before - len(pending)} 篇。")
+
     pending = [
         item for item in pending
-        if not (item.get("pmid") and (PDF_DIR / f"{item['pmid']}.pdf").exists())
+        if not _existing_fulltext_path(item["pmid"])
     ]
     logger.info(f"过滤已下载后待重试 {len(pending)} 篇。")
 
@@ -1026,10 +1111,16 @@ def run_pdf_retry(db_path: Path = DB_PATH):
         missing_pmcs = [item["pmc_id"] for item in missing if item.get("pmc_id")]
         if missing_pmcs:
             logger.info(f"需重新查询 OA 链接 {len(missing_pmcs)} 篇...")
-            oa_links, _ = fetch_oa_links(missing_pmcs)
+            oa_links, network_failed = fetch_oa_links(missing_pmcs)
             for item in pending:
                 if not item.get("links"):
                     item["links"] = oa_links.get(item.get("pmc_id"), {})
+            # 查不到链接且不是网络故障 = 非 OA，重试也没有意义
+            retryable = set(network_failed)
+            not_oa = [item for item in pending if not item["links"] and item["pmc_id"] not in retryable]
+            if not_oa:
+                logger.info(f"跳过 {len(not_oa)} 篇无 OA 全文的文献（非网络故障）。")
+                pending = [item for item in pending if item not in not_oa]
 
     success_count = 0
     failed_items: list[dict] = []

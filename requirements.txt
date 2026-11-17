@@ -7,6 +7,10 @@ requests>=2.31.0
 # XML 解析（比标准库 xml.etree 更快且容错性更好）
 lxml>=5.1.0
 
+# PDF 结构/文本检查（全文库完整性体检）；cryptography 用于解 AES 加密的老 PDF
+pypdf>=5.0.0
+cryptography>=42
+
 # LLM 验证（DeepSeek 等 OpenAI 兼容 API）
 openai>=1.0.0
 

@@ -46,6 +46,7 @@ class TestStageSelection(unittest.TestCase):
                           side_effect=rec("export_filtered", Path("out_filtered.csv"))), \
              patch.object(iu, "export_by_research_field",
                           side_effect=rec("export_by_field", [Path("out_植物保护.csv")])), \
+             patch("downloader.fulltext_library.prune_relevant_fulltext"), \
              patch.object(iu, "get_removed_pmids", side_effect=rec("removed", set())), \
              patch.object(iu, "mark_removed_pmids"):
             iu.main()
@@ -126,7 +127,8 @@ class TestStageSelection(unittest.TestCase):
              patch.object(iu, "export_incremental_filtered_csv",
                           side_effect=fake_export_filtered), \
              patch.object(iu, "export_by_research_field",
-                          side_effect=fake_export_by_field):
+                          side_effect=fake_export_by_field), \
+            patch("downloader.fulltext_library.prune_relevant_fulltext"):
             iu.main()
 
         self.assertEqual(seen.get("since"), "2025-08-01T00:00:00")

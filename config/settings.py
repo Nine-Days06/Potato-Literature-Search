@@ -15,6 +15,47 @@ from dotenv import load_dotenv
 _BASE_DIR = Path(__file__).parent.parent
 load_dotenv(Path(__file__).parent / ".env")
 
+# ── 配置助手 ──────────────────────────────────────────────────
+# 必须定义在所有读取环境变量的段落之前：TDM 段（第 51 行起）就要用 _env_float，
+# 助手若留在文件末尾的 LLM 段里会在导入期抛 NameError。
+def _env_str(name: str, default: str) -> str:
+    """读字符串环境变量；空串视为未设置（.env 里写 KEY= 等同于不写）"""
+    v = os.environ.get(name)
+    return v.strip() if v and v.strip() else default
+
+
+def _env_int(name: str, default: int) -> int:
+    """读整数环境变量；非法值回退默认并给出可读告警"""
+    v = os.environ.get(name)
+    if not v or not v.strip():
+        return default
+    try:
+        return int(v.strip())
+    except ValueError:
+        print(f"[settings] 环境变量 {name}={v!r} 不是整数，回退默认值 {default}")
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """读布尔环境变量；接受 1/true/yes/on（忽略大小写）"""
+    v = os.environ.get(name)
+    if not v or not v.strip():
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    """读浮点环境变量；非法值回退默认并给出可读告警"""
+    v = os.environ.get(name)
+    if not v or not v.strip():
+        return default
+    try:
+        return float(v.strip())
+    except ValueError:
+        print(f"[settings] 环境变量 {name}={v!r} 不是数字，回退默认值 {default}")
+        return default
+
+
 # ── 项目路径 ──────────────────────────────────────────────────
 BASE_DIR    = _BASE_DIR
 DATA_DIR    = BASE_DIR / "data"
@@ -33,18 +74,52 @@ SUBDIR_EXPORT_INCREMENTAL = "exports/incremental"  # 增量交付 CSV
 SUBDIR_REVIEW             = "review"               # 待人工复核清单
 SUBDIR_FAILURE            = "failures"             # 失败清单（LLM / PDF）
 SUBDIR_CACHE              = "cache"                # 检查点与批次中间件
+SUBDIR_TDM                = "tdm"                  # TDM 申请清单与下载计划
 OUTPUT_SUBDIRS = [
     SUBDIR_EXPORT_FULL,
     SUBDIR_EXPORT_INCREMENTAL,
     SUBDIR_REVIEW,
     SUBDIR_FAILURE,
     SUBDIR_CACHE,
+    SUBDIR_TDM,
 ]
 
-# PDF 存储路径
-PDF_DIR = DATA_DIR / "pdfs"
+# 全文存储路径：只保存复核通过的相关文献（按 PMID 命名）
+PDF_DIR = DATA_DIR / "pdfs_relevant"
+# 站点补录（potato-ai.top）里 PubMed 不收的文献全文，按 DOI 命名，与 PDF_DIR 分开
+EXTERNAL_PDF_DIR = DATA_DIR / "pdfs_nonpubmed"
 
 DB_PATH     = PROC_DIR / "potato_lit.db"
+
+# ── TDM（Text and Data Mining）全文获取 ──────────────────────
+# 出版社 TDM API 用于拿订阅内容的全文（Elsevier 给 XML，Wiley/Springer 给 PDF）。
+# 三条渠道的授权模型不同，必须分清：
+#   Wiley   —— TDM Client Token 授权，但官方客户端 README 明确按 IP 判定：
+#              必须在机构网段内执行，校外需先连学校 VPN。申请：
+#              https://static.wiley.com/tdm/ （JS 渲染页，需浏览器打开）
+#              端点 https://api.wiley.com/onlinelibrary/tdm/v1/articles/{DOI}
+#              header `Wiley-TDM-Client-Token: <UUID>`
+#   Springer —— 无 key，Crossref 查 text-mining 链接后按校园 IP 订阅权限下载 PDF。
+#   Elsevier —— API key 只证明注册过，**不含内容权限**。内容权限靠 IP 归属
+#              或 insttoken（X-ELS-Insttoken，需 integration support 签发）。
+#              家庭宽带直连时即使有 key 也只能拿到摘要。端点
+#              https://api.elsevier.com/content/article/doi/{DOI}?httpAccept=text/xml
+# 两个 token 都为空时，相关命令直接报错退出，不会静默跳过。
+WILEY_TDM_TOKEN    = os.environ.get("WILEY_TDM_TOKEN", "").strip() or None
+ELSEVIER_API_KEY   = os.environ.get("ELSEVIER_API_KEY", "").strip() or None
+ELSEVIER_INSTTOKEN = os.environ.get("ELSEVIER_INSTTOKEN", "").strip() or None
+
+# 请求节奏。Wiley 官方文档写「3 篇/秒」，但条款同时限制
+# 「60 次/10 分钟」，后者才是真瓶颈 —— 按 60/10min 折算即 10 秒/篇。
+# 官方 Python 客户端 tdm-client 默认 sleep 5 秒，这里取更保守的 10 秒。
+WILEY_TDM_INTERVAL   = _env_float("WILEY_TDM_INTERVAL", 10.0)
+ELSEVIER_TDM_INTERVAL = _env_float("ELSEVIER_TDM_INTERVAL", 2.0)
+
+# 单篇最大体积（字节）。TDM 返回的是整篇全文，正常 1-10 MB，
+# 超过 50 MB 视为异常响应（多为错误页被当成文件）直接丢弃。
+TDM_MAX_BYTES = _env_int("TDM_MAX_BYTES", 50 * 1024 * 1024)
+# 单次请求超时（秒）
+TDM_TIMEOUT = _env_int("TDM_TIMEOUT", 120)
 
 # ── 网络代理配置 ────────────────────────────────────────────
 # 可选：HTTP/HTTPS 代理，如 http://127.0.0.1:7890（走代理访问 NCBI 等外网）
@@ -143,44 +218,45 @@ RESEARCH_FIELDS = [
     "栽培生理",     # 栽培措施、水肥、光合、胁迫生理、生长调控
     "植物保护",     # 病害虫害、病原物、抗性、防治、互作
     "加工储藏",     # 加工工艺、薯片薯条淀粉、贮藏保鲜、抑芽
-    "品质营养",     # 品质性状、成分、营养、感官、食品安全
+    "品质营养",     # 块茎成分、理化与感官品质、营养品质形成
     "产后处理",     # 采后生理、损伤、分选、物流
+    "食品科学",     # 食品工艺与设备、配方与产品开发、食品安全
+    "营养与健康",   # 人体营养、临床与膳食干预、动物饲养营养
+    "生物医学与药理",  # 提取物药理、生物反应器产药用蛋白/疫苗/抗体
+    "材料与能源",   # 淀粉基材料、生物塑料、胶黏剂、生物燃料、废弃物资源化
+    "环境与生态",   # 生命周期评价、温室气体、面源污染、轮作与土壤生态
+    "机械与智能装备",  # 农机装备、智能分选、遥感与决策模型
     "产业经济",     # 产业、市场、贸易、政策、消费
     "综述评论",     # 综述、评论、方法学探讨
     "其他",         # 难以归入上述任一类（兜底，非排除）
 ]
+
+# 提示词里跟在标签后的一句话释义；不参与写库，只用于让模型选对标签。
+RESEARCH_FIELD_HINTS = {
+    "分子生物学": "基因、基因组、表达调控、蛋白结构与功能、组学",
+    "遗传育种": "种质资源、育种方法、品种选育、抗性遗传、基因编辑育种",
+    "栽培生理": "水肥、光温、种薯、光合、胁迫生理、栽培制度",
+    "植物保护": "病害、虫害、杂草、农药、抗性机制、检测诊断",
+    "加工储藏": "贮藏保鲜、加工适性、淀粉与糖代谢、加工后品质变化",
+    "品质营养": "块茎成分、感官与理化品质、营养品质形成",
+    "产后处理": "采后绿变、鲜切、涂膜、无损检测、分选分级",
+    "食品科学": "食品工艺与设备、配方与产品开发、食品安全",
+    "营养与健康": "人体营养、临床与膳食干预、动物饲养营养",
+    "生物医学与药理": "提取物药理、生物反应器产药用蛋白/疫苗/抗体",
+    "材料与能源": "淀粉基材料、生物塑料、胶黏剂、生物燃料、废弃物资源化",
+    "环境与生态": "生命周期评价、温室气体、面源污染、轮作与土壤生态",
+    "机械与智能装备": "农机装备、智能分选、遥感与决策模型",
+    "产业经济": "产业、市场、贸易、政策、消费与人文社科",
+    "综述评论": "综述、展望、评论",
+    "其他": "以上都不贴切时使用",
+}
 
 DEFAULT_RESEARCH_FIELD = "其他"
 
 # ── LLM 验证配置 ──────────────────────────────────────────────
 # 全部可由 config/.env 覆盖，改配置无需动本文件。
 # 未在 .env 中设置时使用下列默认值。
-
-def _env_str(name: str, default: str) -> str:
-    """读字符串环境变量；空串视为未设置（.env 里写 KEY= 等同于不写）"""
-    v = os.environ.get(name)
-    return v.strip() if v and v.strip() else default
-
-
-def _env_int(name: str, default: int) -> int:
-    """读整数环境变量；非法值回退默认并给出可读告警"""
-    v = os.environ.get(name)
-    if not v or not v.strip():
-        return default
-    try:
-        return int(v.strip())
-    except ValueError:
-        print(f"[settings] 环境变量 {name}={v!r} 不是整数，回退默认值 {default}")
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """读布尔环境变量；接受 1/true/yes/on（忽略大小写）"""
-    v = os.environ.get(name)
-    if not v or not v.strip():
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "on")
-
+# 取值助手 _env_str/_env_int/_env_bool/_env_float 定义在文件顶部（TDM 段也要用）。
 
 LLM_PROVIDER = _env_str("LLM_PROVIDER", "openai")   # "deepseek" | "zhipu" | "openai"
 
