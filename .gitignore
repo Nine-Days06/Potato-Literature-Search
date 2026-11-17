@@ -4,10 +4,22 @@ config/.env
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 
 # 运行产物
 data/
 logs/
+*.log
+
+# 一次性探针（`_` 前缀为约定）与根目录临时脚本
+tmp_*.py
+scripts/_*.py
+
+# 一次性分析/交付产物
+reports/
+*.docx
+Functional_genes.latest.txt
 
 # 环境
 .venv/

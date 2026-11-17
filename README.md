@@ -23,7 +23,9 @@ PubMed E-utilities 下载的是 **XML 格式的元数据**（标题、摘要、�
 - XML 结构化程度高，解析准确
 - 不存在版权问题，可自由下载
 
-如需全文，PMC 开放获取文章可通过 `--step pdf` 参数额外下载 PDF，失败后可 `--step pdf-retry` 续传。
+如需全文，分两条路：
+- **开放获取**：PMC 收录的文章用 `--step pdf` 下载 PDF（失败用 `--step pdf-retry` 续传）。
+- **订阅内容**：Wiley / Elsevier / Springer 的文章用 `--step tdm` 走出版社 TDM API（`--step tdm-plan` 只出计划，`--yes` 才真正下载）。
 
 ## 项目结构
 
@@ -36,7 +38,8 @@ Potato-Literature-Search/
 ├── downloader/
 │   ├── __init__.py
 │   ├── pubmed_downloader.py     # NCBI E-utilities 批量下载 XML（并发 + 速率限制）
-│   └── pdf_downloader.py        # PMC 全文下载（PDF/TXT），失败导出清单 + checkpoint 断点续传
+│   ├── pdf_downloader.py        # PMC 全文下载（PDF/TXT），失败导出清单 + checkpoint 断点续传
+│   └── tdm_downloader.py        # 订阅内容全文（Wiley/Springer PDF、Elsevier XML），默认 dry-run
 ├── parser/
 │   ├── __init__.py
 │   └── xml_parser.py            # XML 解析 → SQLite（复用单连接写入）
@@ -51,8 +54,8 @@ Potato-Literature-Search/
 ├── data/
 │   ├── raw_xml/                 # 原始 XML 文件
 │   ├── processed/               # SQLite 数据库（potato_lit.db）
-│   ├── output/                  # CSV 输出
-│   └── pdfs/                    # LLM 判定相关文献的 PDF 全文（无 PDF 时 .txt）
+│   ├── output/                  # CSV 输出（按用途分 6 个子目录，见「输出文件」）
+│   └── pdfs_relevant/           # 相关全文库：只存复核通过文献的全文（PDF / 订阅 XML / .txt）
 ├── logs/                        # 运行日志
 ├── tests/                       # 单元测试
 ├── main.py                      # 一键运行入口
@@ -83,7 +86,8 @@ flowchart LR
     subgraph 进阶
         I[LLM 二次验证<br>相关性判定 + 研究方向分类] --> J[人工复核<br>导入 Y/N]
         J --> K[最终过滤结果]
-        L[PDF 全文下载<br>PMC OA] --> M[aria2c 并发下载]
+        L[PDF 全文下载<br>PMC OA] --> M[aria2c 并发下载<br>失败回退 requests]
+        O[TDM 全文下载<br>Wiley / Elsevier / Springer] --> P[订阅授权全文]
     end
 
     E --> F
@@ -147,17 +151,20 @@ flowchart LR
 已在 2026-10 取消的规则**不要加回**：语言非英文、摘要 `<80` 字符、发表年份越界、文章类型黑名单（Letter/Editorial/Comment 等）、标题 `<10` 字符。
 这些维度改由 LLM 二次验证承担——非英文、短摘要、Letter 类文献同样可能是相关研究。
 
-**研究方向分类**：LLM 验证对判定为 `RELEVANT` 的文献额外输出 `research_field`，取值限定为 `config/settings.py` 中 `RESEARCH_FIELDS` 的十项封闭枚举：
+**研究方向分类**：LLM 验证对判定为 `RELEVANT` 的文献额外输出 `research_field`，取值限定为 `config/settings.py` 中 `RESEARCH_FIELDS` 的十六项封闭枚举（每项的一句话释义在 `RESEARCH_FIELD_HINTS`，会拼进提示词供模型区分）：
 
-分子生物学 / 遗传育种 / 栽培生理 / 植物保护 / 加工储藏 / 品质营养 / 产后处理 / 产业经济 / 综述评论 / 其他
+分子生物学 / 遗传育种 / 栽培生理 / 植物保护 / 加工储藏 / 品质营养 / 产后处理 / 食品科学 / 营养与健康 / 生物医学与药理 / 材料与能源 / 环境与生态 / 机械与智能装备 / 产业经济 / 综述评论 / 其他
 
 `NOT_RELEVANT` 的方向留空；方向缺失或越界时回落 `其他`，不会因此判定失败重试。
 
-**LLM 提示词规则**：系统提示词由三块规则组成，均经 300 篇真实文献基准集 A/B 测试确定（见下节）：
+**LLM 提示词规则**（V12，2026-10-20 起）：口径是「是否与马铃薯有关」，只剔除事实性错误：
 
-1. **核心判定**——文献是否以马铃薯（或其近缘种、块茎/植株/种质资源、病虫害互作、加工产品）为研究对象或重要研究材料；正向覆盖全部研究方向，负向明确 `sweet potato / Ipomoea batatas`（甘薯）为主要研究对象时排除。
-2. **顺带提及判定**——通用方法/多物种并列/仅作对照背景/名称陷阱四类一律 `NOT_RELEVANT`，配两条判定问句（「去掉马铃薯结论是否仍成立」）。
-3. **输出前自检**——先回答 Q1（是否核心研究对象）、Q2（是否仅出现在列表/对比/背景），理由与结论不得矛盾。
+1. **核心判定**——这篇文献是否与马铃薯有关。农学、食品、营养、医学、材料、能源、环境、经济、人文、机械等任何学科，用马铃薯做研究对象、材料、样品、配料、对照、背景都算 `RELEVANT`；马铃薯只出现在物种列表或参考文献里也算。
+2. **唯一的负向**——物种认错（甘薯/木薯/菊芋/非洲马铃薯/马铃薯石斑鱼/龙葵等 Petota 组外物种）、完全无马铃薯线索、同名异物（品牌/地名/鱼类）。
+3. **植保例外**——PVY/PVX/PLRV/PSTVd、致病疫霉、青枯菌、Pectobacterium、胞囊线虫、科罗拉多马铃薯甲虫等马铃薯主要有害生物，即使实验寄主写成番茄/烟草/本氏烟，也判 `RELEVANT`。
+4. **输出前自检**——Q1 主体物种是否确认为非马铃薯、Q2 是否完全找不到马铃薯线索；两者都为否即 `RELEVANT`，不确定时判 `RELEVANT`。
+
+V12 删除了 V2 的「顺带提及」四条、V3 的自检 Q2、V10 的食品/材料排除块——它们的作用就是剔除「只作材料/背景」的文献，与新口径直接冲突。
 
 **未启用**的两块规则：**默认倾向**（证据不足倾向排除，实测会漏收边缘正例）与**物种甄别**（显式列举甘薯/木薯/番茄/非马铃薯 Solanum，对 glm 收益大但对当前生产的 deepseek 会多误排正例）。详见下方选型理由。
 
@@ -205,6 +212,39 @@ python scripts/incremental_update.py --validate --export   # 重跑，补上研�
 
 迁移只删由**已取消规则**写下的 `filter_log` 排除记录，以及 `human_review IS NULL` 的 `llm_validation` 记录；人工复核过（Y/N）的结论一律保留。
 
+### 全文获取
+
+元数据够做相关性判定和方向分类，但下游要读全文时得另外取。按合法性分两条路，互不重叠：
+
+| 层级 | 来源 | 覆盖 | 命令 |
+|------|------|------|------|
+| L0 | PMC OA（S3 桶列举 + JSON 元数据） | 有 PMC ID 的文献里约 21.7% 有 OA 全文 | `--step pdf` / `--step pdf-retry` |
+| L1 | 纯 OA 出版社（Frontiers / PLOS / BMC 等可直连；MDPI 需真实浏览器） | 仅占无 PMC 集合的 0.3% | 未自动化 |
+| L2 | 出版社 TDM API（订阅授权） | 相关文献中属 Wiley / Elsevier / Springer 且有 DOI 的文献 | `--step tdm` |
+
+**只下载相关文献**。`--step pdf` / `--step pdf-retry` / `--step tdm-plan` / `--step tdm` 都按 `_REVIEW_PASS_PREDICATE` 过滤，只处理复核通过的相关文献，统一落到 `data/pdfs_relevant/`（文件名 `<pmid>.pdf|.xml|.txt`）。未验证、`NOT_RELEVANT`、人工复核 `N` 的文献不下载，所以**必须先把 `validate` 跑完**。`--step export`（及增量导出的 `--export`）结束时调用 `downloader/fulltext_library.py::prune_relevant_fulltext`，只删除判定翻转为不相关的副本，不再从任何总库拷贝。
+
+**PMC ID 存在 ≠ 有 OA 全文**。抽样 300 篇有 PMC ID 的文献走 S3 桶列举，只有 65 篇（21.7%）能拿到全文，其余是「订阅内容、PMC 只存元数据」。
+
+**全文库体检**（`scripts/check_fulltext_integrity.py`，只读）。逐篇判断三件事：
+- 结构：能否解析、页数、内容流（`broken`）
+- 内容：出版社版权占位页、扫描件/无文本层、过短（`placeholder` / `no_text` / `too_short`）
+- 身份：数据库标题是否对应这个 PMID。token 覆盖率 ≥0.85 通过；老 PDF 丢词间空格、OCR 错字时用字符 5-gram 覆盖率 ≥0.5 兜底（`mismatch` / `non_english` / `weak`）
+
+默认 dry-run 输出 `data/output/failures/fulltext_integrity_*.csv`。`--apply` 只隔离 `broken` / `placeholder` / `front_page` 到 `data/pdfs_relevant/_quarantine/`，文件移走后 `--step pdf` / `pdf-retry` 自动重抓。`mismatch` 只报告不删——实测仍含预印本改题、非英语原文等正常对应情况。
+
+pypdf 解析不了的（字体编码乱码、AES 加密、扫描件无文本层）再用 MinerU 复核：`python scripts/recheck_with_mineru.py`，283 篇约 22 分钟。它按原判定分组——`unparsed` 走 `--ocr-mode auto`（有文本层，只是字体/加密问题），`no_text` 走 `ocr`（真扫描件）——批量解析前 2 页后重新判定，输出 `fulltext_integrity_mineru_*.csv`。**扫描件必须用 `ocr`**：`auto` 对「有文本层但只有水印」的 PDF 会读文本层就停。
+
+`weak`（标题覆盖率 0.6–0.85）再用 LLM 独立复核：`python scripts/llm_check_fulltext.py`。输入是**数据库标题+摘要 + pypdf 全文文本**（不传 ngram/cov，避免模型为已有判断找理由），输出 `MATCH/MISMATCH/UNSURE` 与 `FULL/PARTIAL/ABSTRACT_ONLY/UNKNOWN`，写 `fulltext_llm_check_*.csv`。默认走本地网关 `group/ds4.1`（`http://127.0.0.1:3425/v1`，无需 key）。实测 334 篇 weak 中 330 篇为 MATCH，规则法的 weak 主要是老 PDF 丢词间空格造成的误报。
+
+**TDM 下载必须显式确认**。`--step tdm` 不加 `--yes` 时只打印规模（各渠道篇数、间隔、预计耗时）与缺 token 的告警，**不发任何请求**。这是硬约束，不是提示：`run_tdm_download(confirm=False)` 在任何分支都返回在下载循环之前。
+
+**为什么不用浏览器抓页面**：出版社站（Wiley / OUP / APS）对自动化浏览器一律 Cloudflare 403，headless / headed Edge / 独立持久化 profile 三种方式实测全部停在 `Just a moment...`。TDM API 是唯一合规且稳定的通道。
+
+**Springer 不需要 key**：先查 Crossref 的 text-mining 链接，再按链接取 PDF；能否拿到正文取决于请求源 IP 是否属订阅机构。校外直连会拿到 HTML 登录页，下载器以 `not_pdf` 拒绝，不会把登录页存成全文。
+
+**Elsevier 的 key 是半成品**，详见[TDM 配置](#tdm-配置configenv)。当前账号没有 insttoken、请求也不来自校园 IP 时，跑 `--step tdm --yes` 会把计划里的 Elsevier 文献全部记为 `no_entitlement` 失败——**先用 `--limit 5` 试 5 篇验证权限**，别直接全量跑。
+
 ## 快速开始
 
 ```bash
@@ -242,8 +282,25 @@ python main.py --step export
 python main.py --step validate --batch
 
 # 6. 下载 OA 全文 PDF
-python main.py --step pdf                     # 仅下载 OA 全文 PDF
+python main.py --step pdf                     # 相关文献 OA 全文 → data/pdfs_relevant/
 python main.py --step pdf-retry               # 仅重试之前失败的下载（断点续传）
+
+# 全文库体检（只读；加 --apply 才隔离 broken/placeholder/front_page）
+python scripts/check_fulltext_integrity.py
+python scripts/check_fulltext_integrity.py --limit 200
+python scripts/recheck_with_mineru.py       # pypdf 解析不了的再走 MinerU OCR
+python scripts/export_fulltext_review.py     # 非 ok 按判定建硬链接到 data/pdf_review/
+python scripts/llm_check_fulltext.py         # weak 全送 LLM 独立复核（标题+摘要 vs pypdf 全文）
+python scripts/check_doi_metadata.py         # 逐条问 Crossref：这个 DOI 指向的是不是这篇文章
+python scripts/build_redownload_targets.py   # 生成重下目标 + 接收方清理两份清单
+python scripts/build_delivery_package.py     # 打成清理包：删除清单 + 新文件 + apply_cleanup.py + 说明
+python scripts/exclude_notice_fulltext.py    # 撤稿原文/撤稿声明/孤立勘误移出全文库（默认 dry-run）
+
+# 7. TDM 全文下载（订阅内容，Wiley/Springer PDF、Elsevier XML）
+python main.py --step tdm-plan                # 只生成计划清单，不发请求
+python main.py --step tdm                     # 只打印规模，不发请求（等价于 dry-run）
+python main.py --step tdm --yes               # 确认后真正下载
+python main.py --step tdm --yes --limit 5     # 先试 5 篇验证 token 与权限
 ```
 
 ### 单步运行
@@ -264,6 +321,15 @@ python main.py --step pdf
 
 # 仅重试之前失败的 OA PDF 下载（断点续传，可中断后重复执行）
 python main.py --step pdf-retry
+
+# 生成 TDM 下载计划（只读库，不发网络请求）
+python main.py --step tdm-plan
+
+# 执行 TDM 下载（默认只打印规模；必须加 --yes 才真正下载）
+python main.py --step tdm --yes
+
+# 用指定计划文件 + 只跑前 N 篇
+python main.py --step tdm --yes --plan data/output/tdm/tdm_plan_20261018_213132.csv --limit 10
 
 # LLM 二次验证（同步模式 5 篇/批）
 python main.py --step validate
@@ -287,11 +353,14 @@ python main.py --query "potato AND drought AND gene"
 
 | 参数 | 适用阶段 | 说明 |
 |------|----------|------|
-| `--step` | 全部 | 运行指定阶段（download / parse / clean / pdf / pdf-retry / validate / import-review / export / all） |
+| `--step` | 全部 | 运行指定阶段（download / parse / clean / pdf / pdf-retry / tdm-plan / tdm / validate / import-review / export / all） |
 | `--batch` | validate | 使用智谱 Batch API 异步验证（仅 `LLM_PROVIDER=zhipu` 时生效，否则自动降级同步） |
 | `--query` | download / all | 自定义 PubMed 搜索词 |
 | `--xml-dir` | parse / all | XML 文件目录（默认 `data/raw_xml/`） |
 | `--csv` | import-review | 人工复核 CSV 文件路径（默认自动查找最新文件） |
+| `--yes` | tdm | 确认执行下载。**不加时只打印规模、绝不发请求** |
+| `--plan` | tdm | 指定下载计划 CSV（默认按数据库实时重算） |
+| `--limit` | tdm | 本次最多处理篇数（`0` 表示空跑一遍流程） |
 | `--skip-filter` | 增量更新 | 跳过硬过滤阶段（仅 `scripts/incremental_update.py`） |
 
 ### LLM 配置（全部通过 `config/.env` 覆盖）
@@ -315,17 +384,34 @@ python main.py --query "potato AND drought AND gene"
 
 空值（`KEY=`）等同于未设置，会回退到默认值；`LLM_PROVIDER` 拼错会在导入时直接报错。
 
+### TDM 配置（`config/.env`）
+
+订阅内容的全文只能走出版社 TDM API，三条渠道的**授权模型完全不同**：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `WILEY_TDM_TOKEN` | 空 | Wiley TDM Client Token（UUID），返回 PDF。**按请求 IP 判定授权**：须在机构网段内，校外先连学校 VPN |
+| `ELSEVIER_API_KEY` | 空 | Elsevier API Key。**只证明注册过，不含内容权限**，见下方说明 |
+| `ELSEVIER_INSTTOKEN` | 空 | Elsevier 机构 token（`X-ELS-Insttoken`），需 integration support 签发 |
+| `WILEY_TDM_INTERVAL` | 10 | 篇间间隔（秒）。官方客户端默认 5，这里按「60 次/10 分钟」条款取更保守值 |
+| `ELSEVIER_TDM_INTERVAL` | 2 | 同上 |
+| `TDM_MAX_BYTES` | 52428800 | 单篇最大体积，超过视为错误页丢弃 |
+| `TDM_TIMEOUT` | 120 | 单次请求超时（秒） |
+
+**Elsevier 的 key 单独拿到没用**。官方原文：「Registering for or holding an API key does not by itself grant access to Elsevier data or content」。内容权限只有两条路：① 请求源 IP 属于订阅机构；② 带 `X-ELS-Insttoken`。家庭宽带直连时即使有 key，API 也只返回书目元数据（`coredata`）没有正文——下载器会识别这种情况并记为 `no_entitlement` 失败，不会把摘要当全文存下来。
+
 ## 输出文件
 
-`data/output/` 按用途分成 5 个子目录，全量与增量分开存放：
+`data/output/` 按用途分成 6 个子目录，全量与增量分开存放：
 
 | 子目录 | 存放内容 |
 |--------|----------|
 | `exports/full/` | 全量交付 CSV（`articles_raw_*` / `llm_filtered_*` / `by_field/` 按方向拆分及其索引） |
 | `exports/incremental/` | 增量交付 CSV（文件名带 `_incremental_since_*`） |
 | `review/` | 待人工复核清单（`llm_review_pending_*`） |
-| `failures/` | 失败清单（`llm_validation_failed_*` / `failed_downloads_*`） |
+| `failures/` | 失败清单（`llm_validation_failed_*` / `failed_downloads_*` / `tdm_failed_*`） |
 | `cache/` | 检查点与中间件（`*_progress.json` / `batch_*` / `oa_download_links_*`），可随时删 |
+| `tdm/` | TDM 申请用的 DOI 清单（`tdm_dois_*` / `tdm_index.csv`）与下载计划（`tdm_plan_*`） |
 
 | 文件 | 说明 |
 |------|------|
@@ -341,9 +427,12 @@ python main.py --query "potato AND drought AND gene"
 | `data/output/exports/incremental/by_field/<方向>/` | **增量 + 按方向拆分**：同上按时段过滤后再分方向，目录内同样两份（`llm_filtered_incremental_since_*_by_field_<方向>_*.csv` + `articles_raw_incremental_since_*_by_field_<方向>_*.csv`） |
 | `data/output/exports/incremental/articles_raw_incremental_*.csv` | **增量导出**：指定时间后新增的复核通过文献原始信息 |
 | `data/output/failures/failed_downloads_*.csv` | PDF 下载失败链接清单（供 `--step pdf-retry` 续跑） |
+| `data/output/failures/tdm_failed_*.csv` | TDM 下载失败清单（`pmid` / `doi` / `publisher` / `status` / `detail`），`status` 区分 `access_denied` / `no_entitlement` / `rate_limited` 等 |
+| `data/output/tdm/tdm_plan_*.csv` | TDM 下载计划（7 列），`--step tdm` 默认按数据库实时重算，也可用 `--plan` 指定某一份 |
+| `data/output/tdm/tdm_dois_<出版社>.csv` | 按出版社分组的 DOI 清单（TDM 申请材料），索引见 `tdm_index.csv` |
 | `data/output/cache/pdf_download_progress.json` | PDF 重试断点（中断后自动恢复） |
 | `data/output/cache/oa_download_links_*.csv` | OA 资源下载链接清单（仅用于缓存复用，不是交付件） |
-| `data/pdfs/` | LLM 判定相关文献的 PDF 全文文件（无 PDF 时回退保存 `.txt` 文本全文） |
+| `data/pdfs_relevant/` | **相关全文库**：只存复核通过文献的全文，按 PMID 命名（PDF / 订阅 XML / 无 PDF 时回退 `.txt`）；判定翻转后副本自动删除 |
 | `logs/` | 各模块运行日志（按名称+日期分文件） |
 
 ---
