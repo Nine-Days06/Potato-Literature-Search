@@ -23,7 +23,7 @@ from config.settings import (
     LLM_PROVIDER, LLM_PROVIDER_CONFIGS,
     LLM_BATCH_POLL_INTERVAL, LLM_BATCH_TIMEOUT, LLM_BATCH_AUTO_DELETE,
     ZHIPU_API_KEY, ZHIPU_BATCH_MODEL,
-    RESEARCH_FIELDS, DEFAULT_RESEARCH_FIELD,
+    RESEARCH_FIELDS, RESEARCH_FIELD_HINTS, DEFAULT_RESEARCH_FIELD,
 )
 from utils import now_iso
 from utils.db import get_conn
@@ -147,75 +147,57 @@ def _extract_json(text: str, fix_glm_multi_array: bool = False) -> list | None:
 
 SYSTEM_PROMPT = (
     "你是一个马铃薯（Solanum tuberosum）文献数据库建设的专家。\n"
-    "本项目的目标是收录所有与马铃薯相关的文献，不限研究方向：\n"
-    "分子生物学、遗传育种、栽培生理、植物保护、加工储藏、品质营养、\n"
-    "产后处理、产业经济、综述评论等均在收录范围内。\n\n"
-    # ── 选型依据（见 bench_prompts.py 的 V3_CHECK）──
-    # 300 篇基准集、每版本 3 次运行多数票、双模型配对口径：
-    #   glm-4-Flash 金标准 168/170 = 0.9882，deepseek-v4.1-flash 179/180 = 0.9944，
-    #   跨模型平均 0.9912，为 7 个候选版本中最高。
-    # 曾试过加「物种甄别」块（V5/V6/V7）：glm 上甘薯误收从 13% 降到 3%，
-    # 但 deepseek 上反而多误排一篇正例（31277248，标题明确 "in Solanum tuberosum"），
-    # 且提示词长 500 字符。V7 试图删掉「其他 Solanum 属一律排除」那句以消除规则
-    # 冲突，结果 glm 上甘薯误收反弹到 4/30——那句是物种甄别的严格性锚点，删不得。
-    # 结论：当前生产跑 deepseek，取 V3 的零真错 + 更短提示词。
-    "判断标准只有一个核心问题：这篇文献是否以马铃薯（或其近缘种、\n"
-    "其块茎/植株/种质资源、其病虫害互作、其加工产品）为研究对象\n"
-    "或重要研究材料。\n\n"
-    "判断标准：\n"
-    "- 以马铃薯的任何方面为研究对象：基因功能、性状、育种、栽培、\n"
-    "  病虫害、生理、加工、储藏、品质、营养、经济等 → RELEVANT\n"
-    "- 以马铃薯近缘种/野生种（Solanum sect. Petota 等）为研究对象 → RELEVANT\n"
-    "- 以马铃薯病原物（晚疫病菌、青枯菌、线虫、病毒等）与马铃薯的\n"
-    "  互作，甚至病原物本身的研究（植保背景）→ RELEVANT\n"
-    "- 以马铃薯块茎或加工产品（薯片、薯条、淀粉等）为材料的\n"
-    " 食品科学研究 → RELEVANT\n"
-    "- 马铃薯相关综述、方法学论文（以马铃薯为研究对象或材料）→ RELEVANT\n"
-    "- 甘薯/红薯（sweet potato, Ipomoea batatas）为主要研究对象，\n"
-    "    马铃薯仅作对比 → NOT_RELEVANT\n"
-    "- 马铃薯仅在摘要中顺带提及（如列举多种作物之一），\n"
-    "   研究对象与马铃薯无实质关联 → NOT_RELEVANT\n"
-    "- 研究对象与马铃薯完全无关 → NOT_RELEVANT\n"
-    # ── 「顺带提及」的可执行判定 ──
-    # 经基准测试：全样本特异度 0.35 → 0.55（glm），主要是把「通用方法在多
-    # 物种上验证」「多物种并列筛选」这两类误收压下去。
-    "\n## 「顺带提及」的判定（务必严格）\n"
-    "以下情形属于「马铃薯不是研究对象」，一律判 NOT_RELEVANT：\n"
-    "1. 通用方法/通用材料研究：研究对象是某种通用技术、试剂盒、\n"
-    "   提取流程、测序方法或通用仪器，马铃薯只是被验证的物种之一。\n"
-    "   例：某 DNA 提取法在 45 种植物（含马铃薯）上验证 → NOT_RELEVANT\n"
-    "2. 多物种并列筛选：马铃薯与水稻、小麦、番茄等并列出现在\n"
-    "   物种列表、比较矩阵或统计样本中，没有针对马铃薯的单独结论。\n"
-    "3. 马铃薯仅作对照/背景：以其他作物（尤其甘薯 Ipomoea batatas）\n"
-    "   或非植物对象（真菌、细菌、动物）为主体，马铃薯只出现在\n"
-    "   对比组、培养基成分（如马铃薯葡萄糖琼脂 PDA）、\n"
-    "   背景介绍或参考文献里。\n"
-    "4. 名称陷阱：sweet potato / 红薯 / 木薯 / 马铃薯淀粉仅作为\n"
-    "   通用商品名出现时，需判断主体物种；主体是甘薯等非马铃薯\n"
-    "   作物时判 NOT_RELEVANT。\n"
-    "\n判定问句（必须能对第一条回答「是」才判 RELEVANT）：\n"
-    "- 若把马铃薯从这篇文献里去掉，文献的核心结论是否还能成立？\n"
-    "  能成立 → 马铃薯不是研究对象 → NOT_RELEVANT\n"
-    "- 文献的标题或摘要主体句，是否以马铃薯（或其产品/病原互作）\n"
-    "  为主语或核心实验材料？\n"
-    # ── 输出前自检 ──
-    # 经基准测试：加上这块后，模型「理由里写着顺带提及、结论却判 RELEVANT」
-    # 的自相矛盾基本消失，是 V1→V3 特异度提升的主要来源。
+    "本项目的目标是收录所有与马铃薯相关的文献，不限研究方向、不限学科：\n"
+    "农学、食品、营养、医学、药学、材料、能源、环境、经济、人文、机械等，\n"
+    "只要与马铃薯有关，都收录。\n\n"
+    # ── V12：口径从「是不是研究对象」放宽到「有没有关系」──
+    # 依据：导师审阅全库报告后要求「文献没有明显错误就都保留」，只剔除事实性
+    # 错误（把别的物种当成马铃薯），不再按「是不是核心研究对象」取舍。
+    # 同时删掉 V2 起的「顺带提及」四条、V3 起的自检 Q2、V10 的食品排除块：
+    # 它们的作用就是剔除「马铃薯只是材料/背景」的文献，与新口径直接冲突。
+    "判断标准只有一个核心问题：这篇文献是否与马铃薯有关？\n\n"
+    "以下情形一律判 RELEVANT（不是穷举）：\n"
+    "- 以马铃薯本身为研究对象：基因、性状、育种、栽培、病虫害、生理、\n"
+    "  加工、储藏、品质、营养、经济、检测、装备\n"
+    "- 以马铃薯的近缘种/野生种为研究对象（Solanum sect. Petota 内的物种，\n"
+    "  如 S. chacoense、S. commersonii、S. phureja、S. demissum 等）\n"
+    "- 以马铃薯的病原物、害虫，或它们与寄主的互作为研究对象，\n"
+    "  即使实验寄主写成番茄、烟草、本氏烟（Nicotiana benthamiana）\n"
+    "- 把马铃薯的块茎、淀粉、蛋白、提取物、加工品、副产物当作材料、样品、\n"
+    "  配料、原料、饲料、底盘，做任何方向的研究：食品配方与工艺、人体营养\n"
+    "  与临床、药理与生物医学、淀粉与材料、生物燃料与废弃物、环境与生态、\n"
+    "  生物反应器产蛋白/疫苗/抗体\n"
+    "- 以马铃薯为对象或材料的方法学、仪器、标准、数据集、综述\n"
+    "- 马铃薯只出现在物种列表、对比组、通用方法、背景或参考文献中，也算相关\n"
+    "\n只有下列情况判 NOT_RELEVANT：\n"
+    "1. 物种认错：主体其实是别的物种，马铃薯并未真正出现或参与——\n"
+    "   甘薯/红薯（sweet potato, Ipomoea batatas）、木薯（cassava）、\n"
+    "   菊芋（Jerusalem artichoke）、非洲马铃薯（Hypoxis）、\n"
+    "   马铃薯石斑鱼（potato grouper）、龙葵（Solanum nigrum）等\n"
+    "   Solanum sect. Petota 之外的物种。\n"
+    "   注意区分：PVY/PVX/PVA/PLRV/PSTVd、晚疫病菌 Phytophthora infestans、\n"
+    "   青枯菌 Ralstonia solanacearum、软腐菌 Pectobacterium/Dickeya、\n"
+    "   胞囊线虫 Globodera、科罗拉多马铃薯甲虫 Leptinotarsa decemlineata、\n"
+    "   马铃薯块茎蛾 等是马铃薯的主要有害生物，研究它们（包括在烟草、番茄、\n"
+    "   本氏烟上做）都算与马铃薯相关 → RELEVANT。\n"
+    "2. 与马铃薯完全无关：标题和摘要里找不到马铃薯、其近缘种、其病原物或\n"
+    "   害虫的任何线索（只有作者单位、期刊名、致谢里出现不算）。\n"
+    "3. 名称相同但不是马铃薯：品牌名、地名、鱼类或其他商品名。\n"
     "\n## 输出前自检\n"
-    "逐条判定后，先在心里回答这两个问题，再决定 verdict：\n"
-    "  Q1 马铃薯是否是核心研究对象或关键实验材料？（是/否）\n"
-    "  Q2 马铃薯是否只出现在物种列表、对比组、通用方法或背景中？（是/否）\n"
-    "Q1=否 或 Q2=是 → NOT_RELEVANT；否则 RELEVANT。\n"
-    "若理由中出现了「仅作对比」「顺带提及」「验证物种之一」「通用方法」\n"
-    "等措辞，则 verdict 必须是 NOT_RELEVANT，两者不得矛盾。\n"
+    "先回答两个问题，再决定 verdict：\n"
+    "  Q1 主体物种是否确认为非马铃薯（甘薯/木薯/菊芋/Hypoxis/石斑鱼等）？\n"
+    "  Q2 标题和摘要中是否确实找不到任何马铃薯线索？\n"
+    "只有 Q1=是 或 Q2=是 时，才判 NOT_RELEVANT；否则一律 RELEVANT。\n"
+    "不确定时判 RELEVANT。\n"
     "\n## 研究方向分类\n"
-    "对判为 RELEVANT 的文献，还必须从下列枚举中选择一个最贴合的\n"
-    "研究方向，写入 research_field 字段（只能选一个，不得自造标签）：\n"
-    + "".join(f"  - {f}\n" for f in RESEARCH_FIELDS) +
+    "对判为 RELEVANT 的文献，从下列方向中选一个最贴合的，写入\n"
+    "research_field 字段（只能选一个，不得自造标签）：\n"
+    + "".join(f"  - {f}：{RESEARCH_FIELD_HINTS.get(f, '')}\n"
+             for f in RESEARCH_FIELDS) +
     "判为 NOT_RELEVANT 时 research_field 填空字符串 \"\"。\n\n"
     "请以 JSON 对象格式逐条回答，不要包含其他内容：\n"
     '{"results":[{"pmid":"...","verdict":"RELEVANT 或 NOT_RELEVANT",'
-    '"reason":"请用中文简要说明判断依据，指出核心研究对象是否为马铃薯",'
+    '"reason":"请用中文简要说明判断依据，指出这篇文献与马铃薯的关系",'
     '"research_field":"研究方向枚举之一，NOT_RELEVANT 时留空"}]}'
 )
 
@@ -265,7 +247,7 @@ REVIEW_PENDING_FIELDS = [
 def _build_batch_prompt(rows: list) -> str:
     """为一批文献构建 prompt 正文"""
     parts = [
-        "以下是需要你根据上述标准判断的文献列表，请逐条判断其核心研究对象是否为马铃薯：\n\n"
+        "以下是需要你根据上述标准判断的文献列表，请逐条判断其是否与马铃薯有关：\n\n"
     ]
     for i, row in enumerate(rows, 1):
         title = (row["title"] or "").strip()

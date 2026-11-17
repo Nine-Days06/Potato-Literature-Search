@@ -50,47 +50,52 @@ class TestResearchFieldSettings(unittest.TestCase):
 
 
 class TestPromptRules(unittest.TestCase):
-    """提示词的关键规则块（经 300 篇基准集 × 双模型 × 3 次投票选定）
-
-    选型为 bench_prompts.py 的 V3_CHECK，生产 SYSTEM_PROMPT 与之逐字一致。
-    配对口径金标准准确率：glm 168/170 = 0.9882，deepseek 179/180 = 0.9944。
-    这几条断言用于防止后续改动误删关键规则块。
-    """
+    """V12：只剔除事实性错误，其余一律收录（导师审阅口径）"""
 
     def setUp(self):
         from cleaner.llm_validator import SYSTEM_PROMPT
         self.prompt = SYSTEM_PROMPT
 
-    def test_mentions_core_question(self):
+    def test_core_question_is_relatedness(self):
         self.assertIn("Solanum tuberosum", self.prompt)
-        self.assertIn("研究对象", self.prompt)
+        self.assertIn("这篇文献是否与马铃薯有关", self.prompt)
 
     def test_warns_sweet_potato_is_not_potato(self):
         """甘薯混淆是实测中最顽固的错误，负例规则必须保留"""
         self.assertIn("Ipomoea batatas", self.prompt)
         self.assertIn("sweet potato", self.prompt.lower())
 
-    def test_mentions_passing_reference_rule(self):
-        self.assertIn("顺带提及", self.prompt)
+    def test_material_and_background_usage_kept(self):
+        """食品/材料/背景提及全部保留：V12 的核心变化"""
+        self.assertIn("配料、原料、饲料、底盘", self.prompt)
+        self.assertIn("物种列表、对比组、通用方法、背景", self.prompt)
+
+    def test_old_exclusion_blocks_removed(self):
+        """「顺带提及」与食品排除块与新口径冲突，不得回退"""
+        self.assertNotIn("顺带提及", self.prompt)
+        self.assertNotIn("食品科学 / 非农学用途的排除", self.prompt)
+        self.assertNotIn("去掉马铃薯", self.prompt)
 
     def test_has_self_check_step(self):
         self.assertIn("自检", self.prompt)
         self.assertIn("Q1", self.prompt)
         self.assertIn("Q2", self.prompt)
+        self.assertIn("不确定时判 RELEVANT", self.prompt)
 
     def test_no_few_shot_examples(self):
-        """示例已按用户要求删除，不应回退"""
         self.assertNotIn("示例1", self.prompt)
         self.assertNotIn("示例 1", self.prompt)
 
-    def test_no_strict_default_block(self):
-        """「默认倾向排除」会漏收边缘正例（V6 在 pathogen 层漏掉 32719659），不启用"""
-        self.assertNotIn("默认倾向", self.prompt)
-        self.assertNotIn("宁可漏收", self.prompt)
+    def test_plant_protection_exemption(self):
+        """病原物研究即使寄主写烟草/番茄也算相关"""
+        self.assertIn("Nicotiana benthamiana", self.prompt)
+        self.assertIn("Phytophthora infestans", self.prompt)
+        self.assertIn("Leptinotarsa decemlineata", self.prompt)
 
-    def test_species_guard_not_reintroduced(self):
-        """物种甄别块在 deepseek 上会多误排正例（31277248），已按基准数据移除"""
-        self.assertNotIn("物种甄别", self.prompt)
+    def test_prompt_lists_every_field_with_hint(self):
+        from config.settings import RESEARCH_FIELD_HINTS
+        for field in RESEARCH_FIELDS:
+            self.assertIn(f"- {field}：{RESEARCH_FIELD_HINTS[field]}", self.prompt)
 
 
 class TestExtractJsonMultiArray(unittest.TestCase):

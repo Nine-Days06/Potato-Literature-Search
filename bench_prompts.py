@@ -21,7 +21,7 @@ V4_STRICT : 在 V3 基础上把默认倾向改为“存疑即排除”，并给�
     for name, prompt in PROMPT_VARIANTS.items(): ...
 """
 
-from config.settings import RESEARCH_FIELDS
+from config.settings import RESEARCH_FIELDS, RESEARCH_FIELD_HINTS
 
 # ── 各版本共用的骨架片段 ─────────────────────────────────────────
 
@@ -47,6 +47,19 @@ _POSITIVE = (
     "  互作，甚至病原物本身的研究（植保背景）→ RELEVANT\n"
     "- 以马铃薯块茎或加工产品（薯片、薯条、淀粉等）为材料的\n"
     " 食品科学研究 → RELEVANT\n"
+    "- 马铃薯相关综述、方法学论文（以马铃薯为研究对象或材料）→ RELEVANT\n"
+)
+
+# V8 用：删掉「食品科学研究 → RELEVANT」这条正例。
+# 依据：该条是 261 篇「其他」里 C 类（马铃薯仅作原料/材料/工具）被留下的直接根因——
+# 模型读到这条就把「拿薯条做煎炸油实验」「拿马铃薯淀粉做可食用膜」判成相关。
+_POSITIVE_NO_FOOD = (
+    "判断标准：\n"
+    "- 以马铃薯的任何方面为研究对象：基因功能、性状、育种、栽培、\n"
+    "  病虫害、生理、加工、储藏、品质、营养、经济等 → RELEVANT\n"
+    "- 以马铃薯近缘种/野生种（Solanum sect. Petota 等）为研究对象 → RELEVANT\n"
+    "- 以马铃薯病原物（晚疫病菌、青枯菌、线虫、病毒等）与马铃薯的\n"
+    "  互作，甚至病原物本身的研究（植保背景）→ RELEVANT\n"
     "- 马铃薯相关综述、方法学论文（以马铃薯为研究对象或材料）→ RELEVANT\n"
 )
 
@@ -79,6 +92,32 @@ _NEGATIVE_RULES = (
     "  能成立 → 马铃薯不是研究对象 → NOT_RELEVANT\n"
     "- 文献的标题或摘要主体句，是否以马铃薯（或其产品/病原互作）\n"
     "  为主语或核心实验材料？\n"
+)
+
+# V8 用：食品科学/食品工程排除块。
+# 与「加工储藏 / 品质营养」的界线：研究落点是**马铃薯本身**（块茎成分、贮藏期品质、
+# 加工适性、丙烯酰胺生成机制）→ 仍 RELEVANT；落点是**食品/材料/工艺/人体营养**，
+# 马铃薯只是被拿来当原料、样品或对照 → NOT_RELEVANT。
+_FOOD_EXCLUDE = (
+    "\n## 食品科学 / 非农学用途的排除（务必严格）\n"
+    "马铃薯块茎、薯片、薯条、马铃薯淀粉、紫薯粉等**作为原料、样品、\n"
+    "对照或廉价材料**出现，而研究的落点不在马铃薯本身时，一律判 NOT_RELEVANT：\n"
+    "1. 食品配方与产品开发：以马铃薯（或其淀粉、粉、浆）为配料之一做\n"
+    "   面包/面条/零食/香肠/可食用膜/包装材料，结论是配方优化、质构、\n"
+    "   感官或货架期 → NOT_RELEVANT\n"
+    "2. 食品工艺与设备：煎炸油劣变、膨化、干燥、杀菌、挤压等工艺参数\n"
+    "   研究，马铃薯只是被加工的物料 → NOT_RELEVANT\n"
+    "3. 人体营养与临床：以马铃薯作试验餐、膳食组分，研究血糖/胰岛素/\n"
+    "   饱腹感/疾病风险 → NOT_RELEVANT\n"
+    "4. 非食品用途的材料与化工：马铃薯淀粉做黏合剂、絮凝剂、生物塑料、\n"
+    "   药用辅料、黏膜黏附材料等 → NOT_RELEVANT\n"
+    "5. 其他物种产品冒充：紫薯粉、甘薯淀粉、木薯淀粉等被当作\n"
+    "   「potato starch」类通用原料时，先辨物种，主体非马铃薯 → NOT_RELEVANT\n"
+    "\n注意区分（这些仍属 RELEVANT）：\n"
+    "- 研究马铃薯块茎自身的成分、结构、代谢与品质形成（淀粉合成、\n"
+    "  低温糖化 CIS、丙烯酰胺前体、干物质、色泽、抗性淀粉）→ RELEVANT\n"
+    "- 研究马铃薯的贮藏、加工适性与加工后品质变化，结论服务于马铃薯\n"
+    "  产业（品种筛选、贮藏条件、加工专用品种）→ RELEVANT\n"
 )
 
 _CHECK_STEP = (
@@ -192,6 +231,143 @@ V6_SPECIES_STRICT = _ROLE + _SPECIES_GUARD + _CORE_Q + _POSITIVE + _NEGATIVE_BAS
 V7_SPECIES_FIXED = _ROLE + _SPECIES_GUARD_FIXED + _CORE_Q + _POSITIVE + _NEGATIVE_BASIC + \
     _NEGATIVE_RULES + _CHECK_STEP + _research_block() + _OUTPUT
 
+# V8：V3 + 食品科学/非农学用途排除块，并删掉 _POSITIVE 里
+# 「以马铃薯块茎或加工产品为材料的食品科学研究 → RELEVANT」这条。
+# 依据：261 篇「其他」的 C 类（马铃薯仅作原料/材料/工具，174 篇）就是被这条留下的。
+V8_FOOD_EXCLUDE = _ROLE + _CORE_Q + _POSITIVE_NO_FOOD + _NEGATIVE_BASIC + \
+    _NEGATIVE_RULES + _FOOD_EXCLUDE + _CHECK_STEP + _research_block() + _OUTPUT
+
+# V9：只加排除块、保留原来的食品科学正例（对照用，检验规则冲突是否被
+# 更具体的排除块覆盖）。若 V9 ≈ V8，说明删正例行不是必需的。
+V9_FOOD_EXCLUDE_KEEP_POS = _ROLE + _CORE_Q + _POSITIVE + _NEGATIVE_BASIC + \
+    _NEGATIVE_RULES + _FOOD_EXCLUDE + _CHECK_STEP + _research_block() + _OUTPUT
+
+# V10 用：把「食品科学研究 → RELEVANT」这条正例**改写成与排除块一致的表述**。
+# V8（直接删）与 V9（原样保留、靠排除块压制）在基准上都不理想：
+#   V8 删掉后 Solanum 糖苷生物碱类（PMID 39271954，金标 Y）掉出；
+#   V9 靠"后出现的规则更具体"压住冲突，规则文本自相矛盾，维护时极易被改坏。
+# V10 把这条正例的落点从"食品科学"改成"马铃薯块茎自身"，冲突从根上消失。
+_POSITIVE_NO_FOOD_CONSISTENT = (
+    "判断标准：\n"
+    "- 以马铃薯的任何方面为研究对象：基因功能、性状、育种、栽培、\n"
+    "  病虫害、生理、加工、储藏、品质、营养、经济等 → RELEVANT\n"
+    "- 以马铃薯近缘种/野生种（Solanum sect. Petota 等）为研究对象 → RELEVANT\n"
+    "- 以马铃薯病原物（晚疫病菌、青枯菌、线虫、病毒等）与马铃薯的\n"
+    "  互作，甚至病原物本身的研究（植保背景）→ RELEVANT\n"
+    "- 以马铃薯块茎自身的成分、结构、代谢与品质形成为研究内容\n"
+    "  （淀粉合成、低温糖化、丙烯酰胺前体、干物质、色泽、抗性淀粉）→ RELEVANT\n"
+    "- 马铃薯相关综述、方法学论文（以马铃薯为研究对象或材料）→ RELEVANT\n"
+)
+
+# V10：V8 的排除块 + 与之一致的正例表述（不再保留"食品科学 → RELEVANT"）
+V10_FOOD_CONSISTENT = _ROLE + _CORE_Q + _POSITIVE_NO_FOOD_CONSISTENT + _NEGATIVE_BASIC + \
+    _NEGATIVE_RULES + _FOOD_EXCLUDE + _CHECK_STEP + _research_block() + _OUTPUT
+
+
+# V11 用：植物保护例外块。V10 的「顺带提及/材料」判定会把「以马铃薯病原为研究
+# 对象、但实验寄主写成番茄/烟草/N. benthamiana」的文献误判（全库实测 122 篇，
+# 见 recheck_other/qc_pathogen.py）。此块给植保开一条明确豁免，并排除
+# 「病原物只作表达载体/纳米材料/疫苗平台」的工具型用法。
+_PLANT_PROTECT_GUARD = (
+    "\n## 植物保护例外（优先于上述「顺带提及」条款）\n"
+    "研究**对象是马铃薯的病原物、害虫，或它们与寄主的互作机制**时，\n"
+    "即使出现下列情况，仍判 RELEVANT：\n"
+    "- 实验寄主写成番茄、烟草、本氏烟（Nicotiana benthamiana）等模式/易感植物；\n"
+    "- 病原物在人工培养基、细胞系或异源寄主上扩繁、传代；\n"
+    "- 标题只写病原物名（PVY、PVX、PSTVd、晚疫病菌、青枯菌、线虫、甲虫），\n"
+    "  没写 potato。\n"
+    "判别依据：该病原/害虫是否为马铃薯生产上的主要有害生物——马铃薯病毒\n"
+    "Y/X/A/S/M、马铃薯卷叶病毒 PLRV、马铃薯纺锤块茎类病毒 PSTVd、\n"
+    "致病疫霉 Phytophthora infestans（晚疫病）、Alternaria solani（早疫病）、\n"
+    "青枯菌 Ralstonia solanacearum、Pectobacterium/Dickeya（软腐/黑胫）、\n"
+    "马铃薯胞囊线虫 Globodera、根结线虫 Meloidogyne、疮痂链霉菌\n"
+    "Streptomyces scabies、粉痂菌 Spongospora、癌肿菌 Synchytrium、\n"
+    "科罗拉多马铃薯甲虫 Leptinotarsa decemlineata、马铃薯块茎蛾；\n"
+    "且研究目的是抗性机制、致病机理、检测诊断、防治或药剂筛选。\n"
+    "此时自检 Q2 应回答「否」（病原物本身即代表马铃薯生产上的有害生物）。\n"
+    "\n不属于本例外（仍判 NOT_RELEVANT）：\n"
+    "- 病原物只作**表达载体/纳米材料/疫苗展示平台**（如用 PVX 病毒载体\n"
+    "  表达外源蛋白、病毒颗粒展示抗原、基因递送），落点不在马铃薯植保；\n"
+    "- 病原物只是背景引用，研究主体是其他作物的病害且与马铃薯无关联。\n"
+)
+
+# V11：V10 + 植物保护例外（修复「病原物研究对象被误判成顺带提及」）
+
+# ── V12 ──────────────────────────────────────────────────────────
+# 口径变更：从「马铃薯是不是核心研究对象」放宽到「是否与马铃薯有关」。
+# 依据：导师审阅全库报告后要求「文献没有明显错误就都保留」，只剔除事实性错误
+# （甘薯/木薯/菊芋/Hypoxis/石斑鱼等物种认错）。因此删掉 V2 的「顺带提及」四条、
+# V3 的自检 Q2、V10 的食品排除块——它们的作用就是剔除「只作材料/背景」的文献。
+# 生产 SYSTEM_PROMPT 与本版本逐字一致（tests/test_llm_validator.py 守护）。
+_V12_ROLE = (
+    "你是一个马铃薯（Solanum tuberosum）文献数据库建设的专家。\n"
+    "本项目的目标是收录所有与马铃薯相关的文献，不限研究方向、不限学科：\n"
+    "农学、食品、营养、医学、药学、材料、能源、环境、经济、人文、机械等，\n"
+    "只要与马铃薯有关，都收录。\n\n"
+)
+
+_V12_RULES = (
+    "判断标准只有一个核心问题：这篇文献是否与马铃薯有关？\n\n"
+    "以下情形一律判 RELEVANT（不是穷举）：\n"
+    "- 以马铃薯本身为研究对象：基因、性状、育种、栽培、病虫害、生理、\n"
+    "  加工、储藏、品质、营养、经济、检测、装备\n"
+    "- 以马铃薯的近缘种/野生种为研究对象（Solanum sect. Petota 内的物种，\n"
+    "  如 S. chacoense、S. commersonii、S. phureja、S. demissum 等）\n"
+    "- 以马铃薯的病原物、害虫，或它们与寄主的互作为研究对象，\n"
+    "  即使实验寄主写成番茄、烟草、本氏烟（Nicotiana benthamiana）\n"
+    "- 把马铃薯的块茎、淀粉、蛋白、提取物、加工品、副产物当作材料、样品、\n"
+    "  配料、原料、饲料、底盘，做任何方向的研究：食品配方与工艺、人体营养\n"
+    "  与临床、药理与生物医学、淀粉与材料、生物燃料与废弃物、环境与生态、\n"
+    "  生物反应器产蛋白/疫苗/抗体\n"
+    "- 以马铃薯为对象或材料的方法学、仪器、标准、数据集、综述\n"
+    "- 马铃薯只出现在物种列表、对比组、通用方法、背景或参考文献中，也算相关\n"
+    "\n只有下列情况判 NOT_RELEVANT：\n"
+    "1. 物种认错：主体其实是别的物种，马铃薯并未真正出现或参与——\n"
+    "   甘薯/红薯（sweet potato, Ipomoea batatas）、木薯（cassava）、\n"
+    "   菊芋（Jerusalem artichoke）、非洲马铃薯（Hypoxis）、\n"
+    "   马铃薯石斑鱼（potato grouper）、龙葵（Solanum nigrum）等\n"
+    "   Solanum sect. Petota 之外的物种。\n"
+    "   注意区分：PVY/PVX/PVA/PLRV/PSTVd、晚疫病菌 Phytophthora infestans、\n"
+    "   青枯菌 Ralstonia solanacearum、软腐菌 Pectobacterium/Dickeya、\n"
+    "   胞囊线虫 Globodera、科罗拉多马铃薯甲虫 Leptinotarsa decemlineata、\n"
+    "   马铃薯块茎蛾 等是马铃薯的主要有害生物，研究它们（包括在烟草、番茄、\n"
+    "   本氏烟上做）都算与马铃薯相关 → RELEVANT。\n"
+    "2. 与马铃薯完全无关：标题和摘要里找不到马铃薯、其近缘种、其病原物或\n"
+    "   害虫的任何线索（只有作者单位、期刊名、致谢里出现不算）。\n"
+    "3. 名称相同但不是马铃薯：品牌名、地名、鱼类或其他商品名。\n"
+)
+
+_V12_CHECK = (
+    "\n## 输出前自检\n"
+    "先回答两个问题，再决定 verdict：\n"
+    "  Q1 主体物种是否确认为非马铃薯（甘薯/木薯/菊芋/Hypoxis/石斑鱼等）？\n"
+    "  Q2 标题和摘要中是否确实找不到任何马铃薯线索？\n"
+    "只有 Q1=是 或 Q2=是 时，才判 NOT_RELEVANT；否则一律 RELEVANT。\n"
+    "不确定时判 RELEVANT。\n"
+)
+
+_V12_RESEARCH_BLOCK = (
+    "\n## 研究方向分类\n"
+    "对判为 RELEVANT 的文献，从下列方向中选一个最贴合的，写入\n"
+    "research_field 字段（只能选一个，不得自造标签）：\n"
+    + "".join(f"  - {f}：{RESEARCH_FIELD_HINTS.get(f, '')}\n"
+             for f in RESEARCH_FIELDS) +
+    "判为 NOT_RELEVANT 时 research_field 填空字符串 \"\"。\n"
+)
+
+_V12_OUTPUT = (
+    "\n请以 JSON 对象格式逐条回答，不要包含其他内容：\n"
+    '{"results":[{"pmid":"...","verdict":"RELEVANT 或 NOT_RELEVANT",'
+    '"reason":"请用中文简要说明判断依据，指出这篇文献与马铃薯的关系",'
+    '"research_field":"研究方向枚举之一，NOT_RELEVANT 时留空"}]}'
+)
+
+V12_RELATEDNESS = _V12_ROLE + _V12_RULES + _V12_CHECK + _V12_RESEARCH_BLOCK + _V12_OUTPUT
+
+V11_PLANT_PROTECT = _ROLE + _CORE_Q + _POSITIVE_NO_FOOD_CONSISTENT + _NEGATIVE_BASIC + \
+    _NEGATIVE_RULES + _FOOD_EXCLUDE + _PLANT_PROTECT_GUARD + _CHECK_STEP + \
+    _research_block() + _OUTPUT
+
 PROMPT_VARIANTS = {
     "V1_BARE": V1_BARE,
     "V2_RULES": V2_RULES,
@@ -200,6 +376,11 @@ PROMPT_VARIANTS = {
     "V5_SPECIES": V5_SPECIES,
     "V6_SPECIES_STRICT": V6_SPECIES_STRICT,
     "V7_SPECIES_FIXED": V7_SPECIES_FIXED,
+    "V8_FOOD_EXCLUDE": V8_FOOD_EXCLUDE,
+    "V9_FOOD_EXCLUDE_KEEP_POS": V9_FOOD_EXCLUDE_KEEP_POS,
+    "V10_FOOD_CONSISTENT": V10_FOOD_CONSISTENT,
+    "V11_PLANT_PROTECT": V11_PLANT_PROTECT,
+    "V12_RELATEDNESS": V12_RELATEDNESS,
 }
 
 
